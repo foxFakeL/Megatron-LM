@@ -156,6 +156,9 @@ class TopKRouter(Router):
             self.local_tokens_per_expert = None
             self.expert_bias = None
 
+        from slime.utils.routing_replay import register_routing_replay
+        register_routing_replay(self)
+
     def _maintain_float32_expert_bias(self):
         """
         Maintain the expert bias in float32.

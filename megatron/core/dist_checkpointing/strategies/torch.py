@@ -427,6 +427,15 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
+@dataclass
+class MCoreMetadata(Metadata):
+    """Metadata with mcore specific data."""
+
+    # holds data related to flattened_range
+    # TODO: remove when flattened_range is properly removed
+    mcore_data: Optional[Dict[str, Dict[str, Any]]] = None  # Mcore related data about each tensor
+
+
 @dataclass(frozen=True)
 class MCoreSavePlan(SavePlan):
     """SavePlan with MCore specific data."""
@@ -499,9 +508,10 @@ class MCoreSavePlanner(DefaultSavePlanner):
     def create_global_plan(self, all_plans: List[MCoreSavePlan]) -> Tuple[List[SavePlan], Metadata]:
         """Merges MCore data for all plans."""
         global_plan, metadata = super().create_global_plan(all_plans)
-        metadata.mcore_data = dict(
+        mcore_data = dict(
             ChainMap(*(plan.mcore_data for plan in all_plans))  # type: ignore[arg-type]
         )
+        metadata = MCoreMetadata(mcore_data=mcore_data, **vars(metadata))
         return global_plan, metadata
 
     def create_decentralized_global_plan(self, local_plan: SavePlan) -> SavePlan:
@@ -556,10 +566,12 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
     def _validate_global_shapes(self, metadata, sharded_tensors):
         for sh_ten in sharded_tensors:
             if sh_ten.key not in metadata.state_dict_metadata:
-                raise KeyError(
-                    f"{sh_ten.key} from model not in state dict:"
-                    f" {sorted(metadata.state_dict_metadata.keys())}"
-                )
+                # raise KeyError(
+                #     f"{sh_ten.key} from model not in state dict:"
+                #     f" {sorted(metadata.state_dict_metadata.keys())}"
+                # )
+                print(f"{sh_ten.key} from model not in state dict, will skip")
+                continue
             loaded_shape = metadata.state_dict_metadata[sh_ten.key].size
             expected_shape = self._expected_shape(sh_ten)
             if loaded_shape != expected_shape:
@@ -589,7 +601,7 @@ class MCoreLoadPlanner(DefaultLoadPlanner):
         tensor_metadata = self.metadata.state_dict_metadata
         metadata_with_sizes = [
             (tensor_metadata[key], tensor_metadata[key].size, sharded_tensor)
-            for key, sharded_tensor in self.allow_shape_mismatch_sharded_tensors.items()
+            for key, sharded_tensor in self.allow_shape_mismatch_sharded_tensors.items() if key in tensor_metadata
         ]
         try:
             # Temporarily set sizes to expected shapes
@@ -918,6 +930,7 @@ class TorchDistLoadShardedStrategy(LoadShardedStrategy):
             planner=MCoreLoadPlanner(
                 shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
                 allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                allow_partial_load=True,
             ),
         )
 

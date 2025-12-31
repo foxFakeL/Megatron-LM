@@ -138,6 +138,8 @@ class _HuggingFaceTokenizer(MegatronTokenizer):
                 f"The transformers library must be installed to use huggingface_tokenizer_provider"
             )
 
+        if "trust_remote_code" not in kwargs:
+            kwargs["trust_remote_code"] = True
         # TODO(bnorick): download tokenizer once to lustre and use force offline to make sure all tasks read it from there
         self._tokenizer = transformers.AutoTokenizer.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_name_or_path, **kwargs
