@@ -84,8 +84,6 @@ class _ExpertWeightCacheContext(contextlib.AbstractContextManager):
         return self.cache
 
     def __exit__(self, exc_type, exc, tb):
-        if not self.training:
-            self.cache.release()
         return False
 
 
@@ -130,8 +128,6 @@ class ExpertWeightCache:
             current_device = torch.device("cuda", torch.cuda.current_device())
         for entry in self._entries:
             if current_device is None:
-                if training and entry.param.requires_grad and entry.hook_handle is None:
-                    entry.hook_handle = self._register_grad_hook(entry)
                 entry.param.data = entry.cpu_buffer
                 entry.device = entry.cpu_buffer.device
                 entry.is_loaded = False
@@ -142,8 +138,6 @@ class ExpertWeightCache:
             entry.param.data = gpu_tensor
             entry.device = current_device
             entry.is_loaded = True
-            if training and entry.param.requires_grad and entry.hook_handle is None:
-                entry.hook_handle = self._register_grad_hook(entry)
 
     def release(self):
         if not self.enabled or self._entries is None:
@@ -182,11 +176,6 @@ class ExpertWeightCache:
         entries: List[_ExpertWeightCacheEntry] = []
         for param in self._params:
             cpu_buffer = param.detach().to('cpu').contiguous()
-            if cpu_buffer.device.type == 'cpu':
-                try:
-                    cpu_buffer = cpu_buffer.pin_memory()
-                except (RuntimeError, AttributeError):
-                    pass
             param.data = cpu_buffer
             entries.append(
                 _ExpertWeightCacheEntry(
@@ -203,6 +192,7 @@ class ExpertWeightCache:
         if not self.enabled:
             return
         self._maybe_initialize_entries()
+        # Note: Pinning memory removed to avoid precision differences
 
 
 
@@ -961,6 +951,62 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
 
+class SequentialMLPFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, self, permuted_local_hidden_states, tokens_per_expert, permuted_probs):
+        ctx.self = self
+        ctx.save_for_backward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+
+        tokens_per_expert_list = tokens_per_expert.tolist()
+        tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert_list)
+        probs_list = torch.split(permuted_probs, tokens_per_expert_list)
+        output_local_list = []
+        for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
+            if tokens.numel() == 0:
+                output_local_list.append(tokens)
+                continue
+            # Move expert to GPU for computation
+            expert.cuda()
+            if self.config.fp8 or self.config.fp4:
+                hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
+                output, output_bias = expert(hidden, probs)
+                output = output[: tokens.shape[0]]
+            else:
+                output, output_bias = expert(tokens, probs)
+            output_local_list.append(output)
+
+        output_local = torch.cat(output_local_list, dim=0)
+        output_bias_local = None
+        return output_local, output_bias_local
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_bias):
+        self = ctx.self
+        permuted_local_hidden_states, tokens_per_expert, permuted_probs = ctx.saved_tensors
+        tokens_per_expert_list = tokens_per_expert.tolist()
+        tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert_list)
+        probs_list = torch.split(permuted_probs, tokens_per_expert_list)
+        grad_list = torch.split(grad_output, tokens_per_expert_list)
+
+        for expert, tokens, probs, grad in zip(self.local_experts, tokens_list, probs_list, grad_list):
+            if tokens.numel() == 0:
+                continue
+            # Move expert to GPU for backward
+            expert.cuda()
+            with torch.enable_grad():
+                tokens = tokens.detach().requires_grad_(True)
+                probs = probs.detach().requires_grad_(False)  # probs may not need grad
+                if self.config.fp8 or self.config.fp4:
+                    hidden, probs_pad = self._pad_tensor_for_quantization(tokens, probs)
+                    output, _ = expert(hidden, probs_pad)
+                    output = output[: tokens.shape[0]]
+                else:
+                    output, _ = expert(tokens, probs)
+                torch.autograd.backward(output, grad)
+
+        return None, None, None, None  # for self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
+
+
 class SequentialMLP(MegatronModule):
     """An implementation of the Experts layer using a sequence of MLP layers.
 
@@ -1040,40 +1086,18 @@ class SequentialMLP(MegatronModule):
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
             permuted_probs = torch.ones_like(permuted_probs)
 
-        training = self.training
-        with self.weight_cache.activate(training=training):
-            if self.num_local_experts == 1:
-                if self.config.fp8 or self.config.fp4:
-                    hidden, probs = self._pad_tensor_for_quantization(
-                        permuted_local_hidden_states, permuted_probs
-                    )
-                    output, output_bias = self.local_experts[0](hidden, probs)
-                    output = output[: permuted_local_hidden_states.shape[0]]
-                else:
-                    output, output_bias = self.local_experts[0](
-                        permuted_local_hidden_states, permuted_probs
-                    )
-                return output, output_bias
+        return SequentialMLPFunction.apply(self, permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
-            tokens_per_expert = tokens_per_expert.tolist()
-            tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert)
-            probs_list = torch.split(permuted_probs, tokens_per_expert)
-            output_local_list = []
-            for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
-                if tokens.numel() == 0:
-                    output_local_list.append(tokens)
-                    continue
-                if self.config.fp8 or self.config.fp4:
-                    hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
-                    output, output_bias = expert(hidden, probs)
-                    output = output[: tokens.shape[0]]
-                else:
-                    output, output_bias = expert(tokens, probs)
-                output_local_list.append(output)
+    def release_weights(self):
+        """Manually release expert weights back to CPU."""
+        for expert in self.local_experts:
+            expert.cpu()
 
-        output_local = torch.cat(output_local_list, dim=0)
-        output_bias_local = None
-        return output_local, output_bias_local
+    def delete_expert_weights(self, expert_idx):
+        """Manually delete a specific expert's weights from GPU."""
+        if 0 <= expert_idx < len(self.local_experts):
+            expert = self.local_experts[expert_idx]
+            expert.cpu()  # Moves weights back to CPU, effectively deleting GPU copy
 
     def backward_dw(self):
         """Backward pass for weight gradients in SequentialMLP."""

@@ -292,6 +292,7 @@ class TestSequentialMLPExpertWeightCache:
         hidden_states, tokens_per_expert, probs = self._generate_inputs(mlp.config, device)
         output, _ = mlp(hidden_states, tokens_per_expert, probs)
         assert output.device.type == 'cuda'
+        mlp.release_weights()  # Manual release
         assert all(param.device.type == 'cpu' for param in mlp.parameters())
         assert mlp.weight_cache._entries is not None
         assert all(not entry.is_loaded for entry in mlp.weight_cache._entries)
@@ -302,10 +303,12 @@ class TestSequentialMLPExpertWeightCache:
         mlp.train()
         device = torch.device('cuda')
         hidden_states, tokens_per_expert, probs = self._generate_inputs(mlp.config, device)
+        hidden_states.requires_grad_(True)
         output, _ = mlp(hidden_states, tokens_per_expert, probs)
         assert any(param.device.type == 'cuda' for param in mlp.parameters())
         loss = output.float().sum()
         torch.autograd.backward(loss)
+        mlp.release_weights()  # Manual release
         assert all(param.device.type == 'cpu' for param in mlp.parameters())
         assert all(
             (param.grad is None) or (param.grad.device.type == 'cpu') for param in mlp.parameters()
