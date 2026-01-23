@@ -15,7 +15,6 @@ from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     maybe_skip_or_early_return_by_cudagraph,
 )
-from megatron.core.transformer.moe.rank_sorter import build_token_rank_sorter
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -132,10 +131,8 @@ class MoELayer(BaseMoELayer):
 
         self.tp_group = pg_collection.tp
 
-        # Initialize router and rank sorter.
+        # Initialize router.
         self.router = TopKRouter(config=self.config, pg_collection=pg_collection)
-        self.rank_sorter = build_token_rank_sorter(config=self.config, pg_collection=pg_collection)
-        self.tp_group = pg_collection.tp
 
         # Initialize latent projections.
         if self.config.moe_latent_size:
@@ -238,11 +235,8 @@ class MoELayer(BaseMoELayer):
                 not self.shared_expert_overlap
             ), "Shared expert overlap not supported when MoE latent projections are used."
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
-        rank_assignment = None
-        if self.rank_sorter is not None:
-            rank_assignment = self.rank_sorter.assign(hidden_states, probs, routing_map)
         hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-            hidden_states, routing_map, probs, rank_assignment=rank_assignment
+            hidden_states, routing_map, probs
         )
         return hidden_states, probs
 

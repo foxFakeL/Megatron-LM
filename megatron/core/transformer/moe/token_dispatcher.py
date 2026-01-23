@@ -8,6 +8,7 @@ import torch
 
 from megatron.core import utils
 from megatron.core.config import is_experimental_enabled
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
@@ -25,16 +26,12 @@ from megatron.core.transformer.moe.fused_a2a import (
     set_deepep_num_sms,
 )
 from megatron.core.transformer.moe.moe_utils import (
-    ProcessGroupCollection,
-    get_align_size_for_quantization,
-    get_capacity,
     maybe_move_tensor_to_cpu,
     pad_routing_map,
     permute,
     sort_chunks_by_idxs,
     unpermute,
 )
-from megatron.core.transformer.moe.rank_sorter import TokenRankSorter
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -57,10 +54,7 @@ class MoETokenDispatcher:
     """
 
     def __init__(
-        self,
-        config: TransformerConfig,
-        pg_collection: Optional[ProcessGroupCollection] = None,
-        rank_sorter: Optional[TokenRankSorter] = None,
+        self, config: TransformerConfig, pg_collection: Optional[ProcessGroupCollection] = None
     ) -> None:
         """
         Initialize the MoE Token Dispatcher.
@@ -85,15 +79,10 @@ class MoETokenDispatcher:
         # as cudagraph outputs when the cuda_graph_scope contains moe_preprocess.
         self.cudagraph_attrs = []
         self.valid_cudagraph_attrs = None
-        self.rank_sorter = rank_sorter
 
     @abstractmethod
     def dispatch_preprocess(
-        self,
-        tokens: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
-        rank_assignment: Optional[torch.Tensor] = None,
+        self, tokens: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Prepares tokens for dispatch without inter-device communication.
 
@@ -253,11 +242,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         self.cudagraph_attrs = ['routing_map']
 
     def dispatch_preprocess(
-        self,
-        hidden_states: torch.Tensor,
-        routing_map: torch.Tensor,
-        probs: torch.Tensor,
-        rank_assignment: Optional[torch.Tensor] = None,
+        self, hidden_states: torch.Tensor, routing_map: torch.Tensor, probs: torch.Tensor
     ):
         """Reshapes hidden states and caches the routing map."""
         self.hidden_shape = hidden_states.shape

@@ -648,8 +648,6 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
     moe_flex_dispatcher_backend: str = "deepep"
-    moe_rank_sorter: Optional[str] = "identity"
-    moe_rank_sorter_builder: Optional[Callable[..., object]] = None
     moe_enable_expert_weight_cache: bool = True
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
