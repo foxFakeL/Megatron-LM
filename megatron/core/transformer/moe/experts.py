@@ -1,11 +1,13 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextlib
 import copy
 import logging
+from dataclasses import dataclass
 from copy import deepcopy
 from functools import partial
 from math import ceil
-from typing import Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -60,6 +62,148 @@ except ImportError:
     HAVE_TE = False
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ExpertWeightCacheEntry:
+    param: Parameter
+    cpu_buffer: torch.Tensor
+    grad_buffer: Optional[torch.Tensor]
+    device: Optional[torch.device]
+    is_loaded: bool = False
+    hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
+
+
+class _ExpertWeightCacheContext(contextlib.AbstractContextManager):
+    def __init__(self, cache: "ExpertWeightCache", training: bool):
+        self.cache = cache
+        self.training = training
+
+    def __enter__(self):
+        self.cache.ensure_on_device(training=self.training)
+        return self.cache
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.training:
+            self.cache.release()
+        return False
+
+
+class ExpertWeightCache:
+    """Caches expert weights on CPU and swaps them to GPU on demand."""
+
+    def __init__(self, parameters: Sequence[Parameter], enabled: bool = True):
+        self.enabled = enabled
+        self._params = self._unique_parameters(parameters) if enabled else tuple()
+        self._entries: Optional[List[_ExpertWeightCacheEntry]] = None
+
+        if not self._params:
+            self.enabled = False
+
+    @staticmethod
+    def _unique_parameters(parameters: Sequence[Parameter]) -> Tuple[Parameter, ...]:
+        seen = set()
+        unique: List[Parameter] = []
+        for param in parameters:
+            if param is None or not isinstance(param, Parameter):
+                continue
+            key = id(param)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(param)
+        return tuple(unique)
+
+    def activate(self, training: bool) -> contextlib.AbstractContextManager:
+        if not self.enabled:
+            return contextlib.nullcontext()
+        return _ExpertWeightCacheContext(self, training)
+
+    def ensure_on_device(self, training: bool):
+        if not self.enabled:
+            return
+        self._maybe_initialize_entries()
+        if self._entries is None:
+            return
+        current_device = None
+        if torch.cuda.is_available():
+            current_device = torch.device("cuda", torch.cuda.current_device())
+        for entry in self._entries:
+            if current_device is None:
+                if training and entry.param.requires_grad and entry.hook_handle is None:
+                    entry.hook_handle = self._register_grad_hook(entry)
+                entry.param.data = entry.cpu_buffer
+                entry.device = entry.cpu_buffer.device
+                entry.is_loaded = False
+                continue
+            if entry.is_loaded and entry.device == current_device:
+                continue
+            gpu_tensor = entry.cpu_buffer.to(current_device, non_blocking=True)
+            entry.param.data = gpu_tensor
+            entry.device = current_device
+            entry.is_loaded = True
+            if training and entry.param.requires_grad and entry.hook_handle is None:
+                entry.hook_handle = self._register_grad_hook(entry)
+
+    def release(self):
+        if not self.enabled or self._entries is None:
+            return
+        for entry in self._entries:
+            self._offload_entry(entry, copy_data=True)
+
+    def _register_grad_hook(self, entry: _ExpertWeightCacheEntry):
+        hook_fn = lambda grad, entry=entry: self._on_grad(entry, grad)
+        if hasattr(entry.param, "register_post_accumulate_grad_hook"):
+            return entry.param.register_post_accumulate_grad_hook(hook_fn)
+        return entry.param.register_hook(hook_fn)
+
+    def _on_grad(self, entry: _ExpertWeightCacheEntry, grad: torch.Tensor):
+        if entry.grad_buffer is None or entry.grad_buffer.shape != grad.shape:
+            entry.grad_buffer = torch.zeros_like(grad, device='cpu')
+        entry.grad_buffer.copy_(grad.detach().to('cpu'))
+        self._offload_entry(entry, copy_data=True)
+        entry.param.grad = entry.grad_buffer
+        return grad
+
+    def _offload_entry(self, entry: _ExpertWeightCacheEntry, copy_data: bool):
+        if not entry.is_loaded:
+            return
+        if copy_data:
+            entry.cpu_buffer.copy_(entry.param.data.detach().to('cpu'))
+        entry.param.data = entry.cpu_buffer
+        entry.is_loaded = False
+
+    def _maybe_initialize_entries(self):
+        if self._entries is not None:
+            return
+        if not self._params:
+            self._entries = None
+            return
+        entries: List[_ExpertWeightCacheEntry] = []
+        for param in self._params:
+            cpu_buffer = param.detach().to('cpu').contiguous()
+            if cpu_buffer.device.type == 'cpu':
+                try:
+                    cpu_buffer = cpu_buffer.pin_memory()
+                except (RuntimeError, AttributeError):
+                    pass
+            param.data = cpu_buffer
+            entries.append(
+                _ExpertWeightCacheEntry(
+                    param=param,
+                    cpu_buffer=cpu_buffer,
+                    grad_buffer=None,
+                    device=None,
+                )
+            )
+        self._entries = entries
+
+    def prime_cpu_storage(self):
+        """Ensure parameters start on CPU until explicitly loaded."""
+        if not self.enabled:
+            return
+        self._maybe_initialize_entries()
+
 
 
 class GroupedMLP(MegatronModule):
@@ -858,6 +1002,10 @@ class SequentialMLP(MegatronModule):
                 tp_group=pg_collection.expt_tp,
             )
             self.local_experts.append(expert)
+        cache_enabled = getattr(self.config, "moe_enable_expert_weight_cache", True)
+        self.weight_cache = ExpertWeightCache(parameters=tuple(self.parameters()), enabled=cache_enabled)
+        if self.weight_cache.enabled:
+            self.weight_cache.prime_cpu_storage()
 
     def _pad_tensor_for_quantization(self, hidden, probs):
         """Padding tensor shape to multiples of 16/32."""
@@ -890,30 +1038,31 @@ class SequentialMLP(MegatronModule):
                 permuted_probs.unsqueeze(-1) * permuted_local_hidden_states
             )
             permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
-            # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
-        if self.num_local_experts == 1:
-            if self.config.fp8 or self.config.fp4:
-                hidden, probs = self._pad_tensor_for_quantization(
-                    permuted_local_hidden_states, permuted_probs
-                )
-                output, output_bias = self.local_experts[0](hidden, probs)
-                output = output[: permuted_local_hidden_states.shape[0]]
-            else:
-                output, output_bias = self.local_experts[0](
-                    permuted_local_hidden_states, permuted_probs
-                )
+        training = self.training
+        with self.weight_cache.activate(training=training):
+            if self.num_local_experts == 1:
+                if self.config.fp8 or self.config.fp4:
+                    hidden, probs = self._pad_tensor_for_quantization(
+                        permuted_local_hidden_states, permuted_probs
+                    )
+                    output, output_bias = self.local_experts[0](hidden, probs)
+                    output = output[: permuted_local_hidden_states.shape[0]]
+                else:
+                    output, output_bias = self.local_experts[0](
+                        permuted_local_hidden_states, permuted_probs
+                    )
+                return output, output_bias
 
-            return output, output_bias
-        else:
             tokens_per_expert = tokens_per_expert.tolist()
             tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert)
             probs_list = torch.split(permuted_probs, tokens_per_expert)
-
             output_local_list = []
-
             for expert, tokens, probs in zip(self.local_experts, tokens_list, probs_list):
+                if tokens.numel() == 0:
+                    output_local_list.append(tokens)
+                    continue
                 if self.config.fp8 or self.config.fp4:
                     hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
                     output, output_bias = expert(hidden, probs)
@@ -922,10 +1071,9 @@ class SequentialMLP(MegatronModule):
                     output, output_bias = expert(tokens, probs)
                 output_local_list.append(output)
 
-            output_local = torch.cat(output_local_list, dim=0)
-            output_bias_local = None
-            # Note: if bias is enabled on experts, it is already added to the output at this point
-            return output_local, output_bias_local
+        output_local = torch.cat(output_local_list, dim=0)
+        output_bias_local = None
+        return output_local, output_bias_local
 
     def backward_dw(self):
         """Backward pass for weight gradients in SequentialMLP."""

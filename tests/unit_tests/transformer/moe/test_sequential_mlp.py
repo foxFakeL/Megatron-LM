@@ -219,6 +219,100 @@ class TestTEParallelSequentialMLP:
         Utils.destroy_model_parallel()
 
 
+class TestSequentialMLPExpertWeightCache:
+    @staticmethod
+    def _create_config(**overrides):
+        base_kwargs = dict(
+            num_layers=1,
+            hidden_size=8,
+            ffn_hidden_size=32,
+            moe_ffn_hidden_size=32,
+            num_attention_heads=1,
+            num_moe_experts=2,
+            activation_func=torch.nn.functional.relu,
+            gated_linear_unit=False,
+            bias_activation_fusion=False,
+            moe_router_topk=1,
+            moe_router_pre_softmax=True,
+            add_bias_linear=False,
+            use_cpu_initialization=True,
+            moe_enable_expert_weight_cache=True,
+        )
+        base_kwargs.update(overrides)
+        return TransformerConfig(**base_kwargs)
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        from megatron.core.tensor_parallel.random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
+
+        tracker = get_cuda_rng_tracker()
+        try:
+            tracker.add(get_expert_parallel_rng_tracker_name(), torch.cuda.current_device())
+        except Exception:
+            pass
+        self.pg_collection = get_default_pg_collection()
+        self.submodules = MLPSubmodules(
+            linear_fc1=ColumnParallelLinear,
+            linear_fc2=RowParallelLinear,
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build_mlp(self, config=None):
+        config = config or self._create_config()
+        return SequentialMLP(
+            num_local_experts=2,
+            config=config,
+            submodules=self.submodules,
+            pg_collection=self.pg_collection,
+        )
+
+    @staticmethod
+    def _generate_inputs(config: TransformerConfig, device: torch.device):
+        tokens_per_expert = torch.tensor([2, 2], device=device)
+        total_tokens = int(tokens_per_expert.sum().item())
+        hidden_states = torch.randn(total_tokens, config.hidden_size, device=device)
+        probs = torch.rand(total_tokens, device=device)
+        return hidden_states, tokens_per_expert, probs
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_cache_primes_params_on_init(self):
+        config = self._create_config(use_cpu_initialization=False)
+        mlp = self._build_mlp(config=config)
+        assert mlp.weight_cache.enabled
+        assert all(param.device.type == 'cpu' for param in mlp.parameters())
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_eval_forward_releases_weights_to_cpu(self):
+        mlp = self._build_mlp()
+        mlp.eval()
+        device = torch.device('cuda')
+        hidden_states, tokens_per_expert, probs = self._generate_inputs(mlp.config, device)
+        output, _ = mlp(hidden_states, tokens_per_expert, probs)
+        assert output.device.type == 'cuda'
+        assert all(param.device.type == 'cpu' for param in mlp.parameters())
+        assert mlp.weight_cache._entries is not None
+        assert all(not entry.is_loaded for entry in mlp.weight_cache._entries)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_training_backward_keeps_grads_on_cpu(self):
+        mlp = self._build_mlp()
+        mlp.train()
+        device = torch.device('cuda')
+        hidden_states, tokens_per_expert, probs = self._generate_inputs(mlp.config, device)
+        output, _ = mlp(hidden_states, tokens_per_expert, probs)
+        assert any(param.device.type == 'cuda' for param in mlp.parameters())
+        loss = output.float().sum()
+        torch.autograd.backward(loss)
+        assert all(param.device.type == 'cpu' for param in mlp.parameters())
+        assert all(
+            (param.grad is None) or (param.grad.device.type == 'cpu') for param in mlp.parameters()
+        )
+        assert mlp.weight_cache._entries is not None
+        assert all(not entry.is_loaded for entry in mlp.weight_cache._entries)
+
 if __name__ == "__main__":
     MLP_test = TestTEParallelSequentialMLP()
     MLP_test.setup_method(method=None)
