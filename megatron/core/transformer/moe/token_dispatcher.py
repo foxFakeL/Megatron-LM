@@ -343,6 +343,113 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         return hidden_states.view(self.hidden_shape)
 
 
+class MoETableTokenDispatcher(MoETokenDispatcher):
+    """
+    Token dispatcher that routes tokens based on a provided routing table.
+    The table maps each token to one or more target ranks.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ) -> None:
+        super().__init__(config=config, pg_collection=pg_collection)
+        self.routing_table = None # Expected shape: [num_tokens, num_ranks] boolean or indices
+        self.num_ranks = self.ep_size
+
+    def dispatch_preprocess(
+        self, hidden_states: torch.Tensor, routing_table: torch.Tensor
+    ):
+        """
+        Prepares tokens for dispatching to specific ranks.
+        routing_table: [num_tokens, num_ranks] bool tensor
+        """
+        self.hidden_shape = hidden_states.shape
+        # [S/TP, B, H] -> [S*B/TP, H]
+        hidden_states = hidden_states.view(-1, self.hidden_shape[-1])
+        num_tokens = hidden_states.size(0)
+        
+        # Calculate how many tokens go to each rank from this rank
+        # input_splits: [num_ranks]
+        input_splits_tensor = routing_table.sum(dim=0).long()
+        self.input_splits = input_splits_tensor.cpu().numpy().tolist()
+        
+        # Exchange split information with all ranks to know how many tokens to receive
+        # all_to_all_metadata is used to exchange these counts
+        output_splits_tensor = torch.empty(self.num_ranks, dtype=torch.long, device=hidden_states.device)
+        
+        torch.distributed.all_to_all_single(output_splits_tensor, input_splits_tensor, group=self.ep_group)
+        self.output_splits = output_splits_tensor.cpu().numpy().tolist()
+
+        # Permute tokens locally to group them by target rank
+        # routing_table is [num_tokens, num_ranks]
+        # target_ranks will have shape [num_total_dispatch_instances] 
+        # where num_total_dispatch_instances = routing_table.sum()
+        # For MoETableTokenDispatcher, we assume each token goes to at least one rank.
+        token_indices, target_ranks = routing_table.nonzero(as_tuple=True)
+        
+        # Sort by target_ranks to group tokens for AlltoAll
+        sorted_indices = torch.argsort(target_ranks)
+        hidden_states = hidden_states[token_indices[sorted_indices]]
+        
+        # For combine_postprocess, we need to know how to put tokens back.
+        # This is more complex if a token was sent to multiple ranks.
+        # But if it's 1-to-1, it's just inverse of sorted_indices.
+        # To support 1-to-many, we might need a different approach for combine.
+        self.token_indices = token_indices[sorted_indices]
+        self.routing_table = routing_table
+        
+        return hidden_states
+
+    def token_dispatch(self, hidden_states: torch.Tensor):
+        """Dispatches tokens using AlltoAll only if ep_size > 1."""
+        if self.ep_size > 1:
+            dispatched_hidden = all_to_all(
+                self.ep_group, hidden_states, self.output_splits, self.input_splits
+            )
+            return dispatched_hidden
+        return hidden_states
+
+    def dispatch_postprocess(self, hidden_states: torch.Tensor):
+        return hidden_states
+
+    def combine_preprocess(self, hidden_states: torch.Tensor):
+        return hidden_states
+
+    def token_combine(self, hidden_states: torch.Tensor):
+        """Reverses the dispatch communication only if ep_size > 1."""
+        if self.ep_size > 1:
+            combined_hidden = all_to_all(
+                self.ep_group, hidden_states, self.input_splits, self.output_splits
+            )
+            return combined_hidden
+        return hidden_states
+
+    def combine_postprocess(self, hidden_states: torch.Tensor):
+        """Restores original order and shape."""
+        # hidden_states here is what we got back from all_to_all in token_combine.
+        # It has the same order as the output of dispatch_preprocess.
+        # We need to scatter it back to the original positions.
+        
+        # Flattened hidden shape [num_tokens, H]
+        num_tokens = 1
+        for dim in self.hidden_shape[:-1]:
+            num_tokens *= dim
+        hidden_size = self.hidden_shape[-1]
+        
+        output = torch.zeros(
+            (num_tokens, hidden_size),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype
+        )
+        
+        # Use index_add if multiple experts/ranks sent back results for the same token
+        output.index_add_(0, self.token_indices, hidden_states)
+        
+        return output.view(self.hidden_shape)
+
+
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
     AlltoAll-based token dispatcher.

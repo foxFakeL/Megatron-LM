@@ -96,12 +96,27 @@ class ExpertWeightCache:
         parameters: Sequence[Parameter],
         enabled: bool = True,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        parameter_groups: Optional[Sequence[Sequence[Parameter]]] = None,
     ):
         self.enabled = enabled
-        self._params = self._unique_parameters(parameters) if enabled else tuple()
-        self._entries: Optional[List[_ExpertWeightCacheEntry]] = None
         self.pg_collection = pg_collection
         self._shm_objs: List[shm.SharedMemory] = []
+        
+        if not enabled:
+            self._params = tuple()
+            self._groups = None
+            return
+
+        if parameter_groups is not None:
+            self._groups = [self._unique_parameters(g) for g in parameter_groups]
+            # Flatten for initial processing if needed
+            self._params = self._unique_parameters([p for g in parameter_groups for p in g])
+        else:
+            self._params = self._unique_parameters(parameters)
+            self._groups = [self._params]
+
+        self._entries: Optional[List[_ExpertWeightCacheEntry]] = None
+        self._param_to_entry_idx = {}
 
         if not self._params:
             self.enabled = False
@@ -123,7 +138,43 @@ class ExpertWeightCache:
     def activate(self, training: bool) -> contextlib.AbstractContextManager:
         if not self.enabled:
             return contextlib.nullcontext()
+        # Default activate loads everything (backwards compatibility)
         return _ExpertWeightCacheContext(self, training)
+
+    def activate_group(self, group_idx: int, training: bool):
+        if not self.enabled:
+            return
+        self._maybe_initialize_entries()
+        if self._entries is None or self._groups is None:
+            return
+        
+        current_device = torch.device("cuda", torch.cuda.current_device())
+        for param in self._groups[group_idx]:
+            entry_idx = self._param_to_entry_idx[id(param)]
+            entry = self._entries[entry_idx]
+            
+            if entry.is_loaded and entry.device == current_device:
+                continue
+                
+            gpu_tensor = entry.cpu_buffer.to(current_device, non_blocking=True)
+            # Use detach() to prevent autograd from tracking the weight swap
+            # We want the weights to be treated as constants in this graph
+            # and re-loaded if necessary.
+            entry.param.data = gpu_tensor
+            entry.device = current_device
+            entry.is_loaded = True
+
+    def release_group(self, group_idx: int, copy_data: bool = True):
+        if not self.enabled or self._entries is None or self._groups is None:
+            return
+        for param in self._groups[group_idx]:
+            entry_idx = self._param_to_entry_idx[id(param)]
+            entry = self._entries[entry_idx]
+            self._offload_entry(entry, copy_data=copy_data)
+            # Crucial: wipe the storage of the GPU tensor to ensure it is freed
+            # Even if other references exist in the autograd graph, this will free the bytes
+            if param.device.type == 'cuda':
+                param.untyped_storage().resize_(0)
 
     def ensure_on_device(self, training: bool):
         if not self.enabled:
@@ -200,6 +251,7 @@ class ExpertWeightCache:
         use_shared_memory = ep_group is not None and ep_group.size() > 1
 
         entries: List[_ExpertWeightCacheEntry] = []
+        self._param_to_entry_idx = {}
         for i, param in enumerate(self._params):
             if use_shared_memory:
                 # Shared memory approach for EP
@@ -238,6 +290,7 @@ class ExpertWeightCache:
                 cpu_buffer = param.detach().to('cpu').contiguous()
 
             param.data = cpu_buffer
+            self._param_to_entry_idx[id(param)] = len(entries)
             entries.append(
                 _ExpertWeightCacheEntry(
                     param=param,
@@ -410,6 +463,16 @@ class GroupedMLP(MegatronModule):
 
         self.register_load_state_dict_post_hook(remove_extra_states_check)
 
+        cache_enabled = getattr(self.config, "moe_enable_expert_weight_cache", True)
+        self.weight_cache = ExpertWeightCache(
+            parameters=tuple(self.parameters()), 
+            enabled=cache_enabled, 
+            pg_collection=pg_collection,
+            parameter_groups=[[self.weight1], [self.weight2]]
+        )
+        if self.weight_cache.enabled:
+            self.weight_cache.prime_cpu_storage()
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -418,57 +481,62 @@ class GroupedMLP(MegatronModule):
     ):
         """Forward step of the GroupedMLP."""
         assert self.config.bf16, "Currently GroupedMLP for MoE only supports bf16."
-        if self.activation_recompute:
-            self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-
-        if self.config.moe_apply_probs_on_input:
-            assert (
-                self.config.moe_router_topk == 1
-            ), "`moe_apply_probs_on_input` only works with `moe_router_topk`=1."
-            original_dtype = permuted_local_hidden_states.dtype
-            permuted_local_hidden_states = (
-                permuted_probs.unsqueeze(-1) * permuted_local_hidden_states
-            )
-            permuted_local_hidden_states = permuted_local_hidden_states.to(original_dtype)
-            # Probs already applied, so reset to 1.
-            permuted_probs = torch.ones_like(permuted_probs)
-
-        if permuted_local_hidden_states.nelement() != 0:
-            # Reshape the weights for the grouped GEMMs.
-            w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
-            w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
-
-            fc1_output = gg.ops.gmm(
-                permuted_local_hidden_states, w1, tokens_per_expert, trans_b=False
-            )
-            if self.activation_recompute:
-                intermediate_parallel = self.activation_checkpoint.checkpoint(
-                    self.activation_func_with_probs, fc1_output, permuted_probs.unsqueeze(-1)
+        
+        # Internal function to handle the actual computation
+        # We need this to use activation checkpointing
+        def custom_forward(
+            permuted_local_hidden_states, 
+            tokens_per_expert, 
+            permuted_probs
+        ):
+            if permuted_local_hidden_states.nelement() != 0:
+                # Ensure tokens_per_expert is on CPU for Grouped GEMM
+                tokens_per_expert_cpu = tokens_per_expert.cpu()
+                # Reshape the weights for the grouped GEMMs.
+                self.weight_cache.activate_group(0, training=self.training)
+                w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
+                fc1_output = gg.ops.gmm(
+                    permuted_local_hidden_states, w1, tokens_per_expert_cpu, trans_b=False
                 )
-                fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
-                self.activation_checkpoint.discard_output_and_register_recompute(fc2_output)
-            else:
+                self.weight_cache.release_group(0, copy_data=False)
+
                 intermediate_parallel = self.activation_func_with_probs(
                     fc1_output, permuted_probs.unsqueeze(-1)
                 )
-                fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert, trans_b=False)
-        else:
-            # No token is allocated for local experts.
-            assert torch.count_nonzero(tokens_per_expert) == 0
-
-            # Make sure params of experts still have gradients even given zero tokens.
-            w1 = self.weight1.view(self.config.hidden_size, -1)
-            w2 = self.weight2.view(-1, self.config.hidden_size)
-            h = torch.matmul(permuted_local_hidden_states, w1)
-            if self.activation_recompute:
-                h = self.activation_checkpoint.checkpoint(
-                    self.activation_func_with_probs, h, permuted_probs.unsqueeze(-1)
-                )
-                fc2_output = torch.matmul(h, w2)
-                self.activation_checkpoint.discard_output_and_register_recompute(fc2_output)
+                
+                self.weight_cache.activate_group(1, training=self.training)
+                w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
+                fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert_cpu, trans_b=False)
+                self.weight_cache.release_group(1, copy_data=False)
             else:
+                # No token is allocated for local experts.
+                assert torch.count_nonzero(tokens_per_expert) == 0
+
+                # Make sure params of experts still have gradients even given zero tokens.
+                w1 = self.weight1.view(self.config.hidden_size, -1)
+                w2 = self.weight2.view(-1, self.config.hidden_size)
+                h = torch.matmul(permuted_local_hidden_states, w1)
                 h = self.activation_func_with_probs(h, permuted_probs.unsqueeze(-1))
                 fc2_output = torch.matmul(h, w2)
+            
+            return fc2_output
+
+        if self.activation_recompute:
+            # We use the standard checkpoint tool to re-run the whole forward during backward
+            # This ensures weights are swapped back in during backward.
+            fc2_output = tensor_parallel.checkpoint(
+                custom_forward,
+                False, # distribute_saved_activations
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs
+            )
+        else:
+            fc2_output = custom_forward(
+                permuted_local_hidden_states,
+                tokens_per_expert,
+                permuted_probs
+            )
 
         return fc2_output, None
 
