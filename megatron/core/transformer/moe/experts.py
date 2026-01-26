@@ -3,6 +3,7 @@
 import contextlib
 import copy
 import logging
+import multiprocessing.shared_memory as shm
 from dataclasses import dataclass
 from copy import deepcopy
 from functools import partial
@@ -90,10 +91,17 @@ class _ExpertWeightCacheContext(contextlib.AbstractContextManager):
 class ExpertWeightCache:
     """Caches expert weights on CPU and swaps them to GPU on demand."""
 
-    def __init__(self, parameters: Sequence[Parameter], enabled: bool = True):
+    def __init__(
+        self,
+        parameters: Sequence[Parameter],
+        enabled: bool = True,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
         self.enabled = enabled
         self._params = self._unique_parameters(parameters) if enabled else tuple()
         self._entries: Optional[List[_ExpertWeightCacheEntry]] = None
+        self.pg_collection = pg_collection
+        self._shm_objs: List[shm.SharedMemory] = []
 
         if not self._params:
             self.enabled = False
@@ -145,6 +153,20 @@ class ExpertWeightCache:
         for entry in self._entries:
             self._offload_entry(entry, copy_data=True)
 
+        ep_group = self.pg_collection.ep if self.pg_collection else None
+        is_rank_0 = ep_group is None or torch.distributed.get_rank(ep_group) == 0
+
+        # Clear shared memory objects
+        for s in self._shm_objs:
+            s.close()
+            if is_rank_0:
+                try:
+                    s.unlink()
+                except FileNotFoundError:
+                    pass
+        self._shm_objs.clear()
+        self._entries = None
+
     def _register_grad_hook(self, entry: _ExpertWeightCacheEntry):
         hook_fn = lambda grad, entry=entry: self._on_grad(entry, grad)
         if hasattr(entry.param, "register_post_accumulate_grad_hook"):
@@ -173,9 +195,48 @@ class ExpertWeightCache:
         if not self._params:
             self._entries = None
             return
+
+        ep_group = self.pg_collection.ep if self.pg_collection else None
+        use_shared_memory = ep_group is not None and ep_group.size() > 1
+
         entries: List[_ExpertWeightCacheEntry] = []
-        for param in self._params:
-            cpu_buffer = param.detach().to('cpu').contiguous()
+        for i, param in enumerate(self._params):
+            if use_shared_memory:
+                # Shared memory approach for EP
+                # All ranks in ep_group should share the same memory.
+                ep_ranks = torch.distributed.get_process_group_ranks(ep_group)
+                base_rank = min(ep_ranks)
+                shm_name = f"megatron_moe_cache_p{i}_r{base_rank}"
+
+                size = param.numel() * param.element_size()
+                is_rank_0 = (torch.distributed.get_rank(ep_group) == 0)
+
+                if is_rank_0:
+                    # Create shared memory
+                    try:
+                        shm.SharedMemory(name=shm_name).unlink()
+                    except FileNotFoundError:
+                        pass
+                    _shm = shm.SharedMemory(create=True, size=size, name=shm_name)
+                
+                # Ensure Rank 0 has created the segment before others open it
+                torch.distributed.barrier(group=ep_group)
+                
+                if not is_rank_0:
+                    _shm = shm.SharedMemory(name=shm_name)
+                
+                self._shm_objs.append(_shm)
+
+                cpu_buffer = torch.frombuffer(_shm.buf, dtype=param.dtype).view(param.shape)
+
+                if is_rank_0:
+                    cpu_buffer.copy_(param.detach().to('cpu'))
+
+                # Wait for rank 0 to finish copying before anyone uses it
+                torch.distributed.barrier(group=ep_group)
+            else:
+                cpu_buffer = param.detach().to('cpu').contiguous()
+
             param.data = cpu_buffer
             entries.append(
                 _ExpertWeightCacheEntry(
@@ -968,7 +1029,7 @@ class SequentialMLPFunction(torch.autograd.Function):
             # Move expert to GPU for computation
             expert.cuda()
             if self.config.fp8 or self.config.fp4:
-                hidden, probs = self._pad_tensor_for_quantization(tokens, probs)
+                hidden, probs = SequentialMLP._pad_tensor_for_quantization(tokens, probs, self.config)
                 output, output_bias = expert(hidden, probs)
                 output = output[: tokens.shape[0]]
             else:
@@ -997,7 +1058,7 @@ class SequentialMLPFunction(torch.autograd.Function):
                 tokens = tokens.detach().requires_grad_(True)
                 probs = probs.detach().requires_grad_(False)  # probs may not need grad
                 if self.config.fp8 or self.config.fp4:
-                    hidden, probs_pad = self._pad_tensor_for_quantization(tokens, probs)
+                    hidden, probs_pad = SequentialMLP._pad_tensor_for_quantization(tokens, probs, self.config)
                     output, _ = expert(hidden, probs_pad)
                     output = output[: tokens.shape[0]]
                 else:
@@ -1049,14 +1110,17 @@ class SequentialMLP(MegatronModule):
             )
             self.local_experts.append(expert)
         cache_enabled = getattr(self.config, "moe_enable_expert_weight_cache", True)
-        self.weight_cache = ExpertWeightCache(parameters=tuple(self.parameters()), enabled=cache_enabled)
+        self.weight_cache = ExpertWeightCache(
+            parameters=tuple(self.parameters()), enabled=cache_enabled, pg_collection=pg_collection
+        )
         if self.weight_cache.enabled:
             self.weight_cache.prime_cpu_storage()
 
-    def _pad_tensor_for_quantization(self, hidden, probs):
+    @staticmethod
+    def _pad_tensor_for_quantization(hidden, probs, config):
         """Padding tensor shape to multiples of 16/32."""
         actual_num_tokens = hidden.shape[0]
-        divisor = get_align_size_for_quantization(self.config)
+        divisor = get_align_size_for_quantization(config)
         padded_num_tokens = ceil(actual_num_tokens / divisor) * divisor - actual_num_tokens
         if padded_num_tokens > 0:
             pad_tensor = torch.zeros(
