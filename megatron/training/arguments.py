@@ -3310,6 +3310,20 @@ def _add_moe_args(parser):
                        help='When there are multiple experts per rank, launch multiple local GEMM kernels in multiple streams to improve the utilization and performance with GroupedLinear in TransformerEngine.')
     group.add_argument('--moe-use-legacy-grouped-gemm', action='store_true',
                        help='Use legacy GroupedMLP rather than TEGroupedMLP. Note: The legacy one will be deprecated soon.')
+
+    group.add_argument(
+        '--moe-enable-expert-weight-cache',
+        action='store_true',
+        default=True,
+        dest='moe_enable_expert_weight_cache',
+        help='Enable expert weight CPU/GPU swap cache in legacy MoE experts (default: enabled).',
+    )
+    group.add_argument(
+        '--no-moe-enable-expert-weight-cache',
+        action='store_false',
+        dest='moe_enable_expert_weight_cache',
+        help='Disable expert weight CPU/GPU swap cache.',
+    )
     group.add_argument('--moe-layer-recompute', action='store_true',
                        help='Enable checkpointing for moe_layer, should be used when memory is not sufficient. '
                        'Deprecated. Use "--recompute-granularity selective --recompute-modules moe" instead.')
