@@ -305,7 +305,8 @@ class TestSequentialMLPExpertWeightCache:
         hidden_states, tokens_per_expert, probs = self._generate_inputs(mlp.config, device)
         hidden_states.requires_grad_(True)
         output, _ = mlp(hidden_states, tokens_per_expert, probs)
-        assert any(param.device.type == 'cuda' for param in mlp.parameters())
+        # Weights may be swapped in per-expert during forward and released immediately.
+        assert all(param.device.type == 'cpu' for param in mlp.parameters())
         loss = output.float().sum()
         torch.autograd.backward(loss)
         mlp.release_weights()  # Manual release
@@ -315,6 +316,78 @@ class TestSequentialMLPExpertWeightCache:
         )
         assert mlp.weight_cache._entries is not None
         assert all(not entry.is_loaded for entry in mlp.weight_cache._entries)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_training_backward_offloads_each_expert_immediately(self):
+        mlp = self._build_mlp()
+        mlp.train()
+
+        device = torch.device('cuda')
+        hidden_states, tokens_per_expert, probs = self._generate_inputs(mlp.config, device)
+        # Ensure both experts are exercised.
+        assert torch.all(tokens_per_expert > 0)
+
+        hidden_states.requires_grad_(True)
+        output, _ = mlp(hidden_states, tokens_per_expert, probs)
+        loss = output.float().sum()
+
+        expert_params = [list(expert.parameters()) for expert in mlp.local_experts]
+        assert len(expert_params) == 2
+
+        events = []
+        in_backward = False
+
+        orig_activate = mlp.weight_cache.activate_group
+        orig_release = mlp.weight_cache.release_group
+        orig_offload = mlp.weight_cache.offload_param_grad_to_cpu
+
+        def activate_group(group_idx: int, training: bool):
+            nonlocal events
+            if in_backward and group_idx > 0:
+                # When we start the next expert, the previous one must already be
+                # swapped back to CPU and have CPU grads attached.
+                for p in expert_params[group_idx - 1]:
+                    assert p.device.type == 'cpu'
+                    assert p.grad is not None
+                    assert p.grad.device.type == 'cpu'
+            events.append(("activate", group_idx))
+            return orig_activate(group_idx, training)
+
+        def release_group(group_idx: int, copy_data: bool = True):
+            nonlocal events
+            events.append(("release_pre", group_idx))
+            out = orig_release(group_idx, copy_data=copy_data)
+            if in_backward:
+                for p in expert_params[group_idx]:
+                    assert p.device.type == 'cpu'
+            events.append(("release_post", group_idx))
+            return out
+
+        def offload_param_grad_to_cpu(param, grad):
+            nonlocal events
+            if in_backward:
+                assert param.device.type == 'cpu'
+            events.append(("offload", id(param)))
+            return orig_offload(param, grad)
+
+        mlp.weight_cache.activate_group = activate_group
+        mlp.weight_cache.release_group = release_group
+        mlp.weight_cache.offload_param_grad_to_cpu = offload_param_grad_to_cpu
+
+        in_backward = True
+        torch.autograd.backward(loss)
+        in_backward = False
+
+        # Verify release/offload for expert 0 happens before expert 1 activates.
+        assert ("release_post", 0) in events
+        assert ("activate", 1) in events
+        assert events.index(("release_post", 0)) < events.index(("activate", 1))
+
+        # After backward, all expert params + grads must be on CPU.
+        assert all(param.device.type == 'cpu' for param in mlp.parameters())
+        assert all(
+            (param.grad is None) or (param.grad.device.type == 'cpu') for param in mlp.parameters()
+        )
 
 if __name__ == "__main__":
     MLP_test = TestTEParallelSequentialMLP()
