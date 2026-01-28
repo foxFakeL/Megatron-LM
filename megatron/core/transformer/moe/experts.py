@@ -141,27 +141,30 @@ class ExpertWeightCache:
         # Default activate loads everything (backwards compatibility)
         return _ExpertWeightCacheContext(self, training)
 
-    def activate_group(self, group_idx: int, training: bool):
+    def activate_group(
+        self, group_idx: int, training: bool, device: Optional[torch.device] = None
+    ):
         if not self.enabled:
             return
         self._maybe_initialize_entries()
         if self._entries is None or self._groups is None:
             return
-        
-        current_device = torch.device("cuda", torch.cuda.current_device())
+
+        if device is None:
+            device = torch.device("cuda", torch.cuda.current_device())
         for param in self._groups[group_idx]:
             entry_idx = self._param_to_entry_idx[id(param)]
             entry = self._entries[entry_idx]
-            
-            if entry.is_loaded and entry.device == current_device:
+
+            if entry.is_loaded and entry.device == device and entry.param.device == device:
                 continue
-                
-            gpu_tensor = entry.cpu_buffer.to(current_device, non_blocking=True)
+
+            gpu_tensor = entry.cpu_buffer.to(device, non_blocking=True)
             # Use detach() to prevent autograd from tracking the weight swap
             # We want the weights to be treated as constants in this graph
             # and re-loaded if necessary.
             entry.param.data = gpu_tensor
-            entry.device = current_device
+            entry.device = device
             entry.is_loaded = True
 
     def release_group(self, group_idx: int, copy_data: bool = True):
@@ -240,12 +243,24 @@ class ExpertWeightCache:
         self._shm_objs.clear()
         self._entries = None
 
-    def _offload_entry(self, entry: _ExpertWeightCacheEntry, copy_data: bool):
-        if not entry.is_loaded:
+    def reset_to_cpu(self):
+        """Force all cached parameters back to CPU buffers."""
+        if not self.enabled:
             return
-        if copy_data:
-            entry.cpu_buffer.copy_(entry.param.data.detach().to('cpu'))
-        entry.param.data = entry.cpu_buffer
+        self._maybe_initialize_entries()
+        if self._entries is None:
+            return
+        for entry in self._entries:
+            entry.param.data = entry.cpu_buffer
+            entry.device = entry.cpu_buffer.device
+            entry.is_loaded = False
+
+    def _offload_entry(self, entry: _ExpertWeightCacheEntry, copy_data: bool):
+        if entry.param.device.type != "cpu":
+            if copy_data:
+                entry.cpu_buffer.copy_(entry.param.data.detach().to('cpu'))
+            entry.param.data = entry.cpu_buffer
+            entry.device = entry.cpu_buffer.device
         entry.is_loaded = False
 
     def _maybe_initialize_entries(self):
@@ -501,7 +516,9 @@ class GroupedMLP(MegatronModule):
                 # Ensure tokens_per_expert is on CPU for Grouped GEMM
                 tokens_per_expert_cpu = tokens_per_expert.cpu()
                 # Reshape the weights for the grouped GEMMs.
-                self.weight_cache.activate_group(0, training=self.training)
+                self.weight_cache.activate_group(
+                    0, training=self.training, device=permuted_local_hidden_states.device
+                )
                 w1 = self.weight1.view(self.num_local_experts, self.config.hidden_size, -1)
                 fc1_output = gg.ops.gmm(
                     permuted_local_hidden_states, w1, tokens_per_expert_cpu, trans_b=False
@@ -512,7 +529,9 @@ class GroupedMLP(MegatronModule):
                     fc1_output, permuted_probs.unsqueeze(-1)
                 )
                 
-                self.weight_cache.activate_group(1, training=self.training)
+                self.weight_cache.activate_group(
+                    1, training=self.training, device=permuted_local_hidden_states.device
+                )
                 w2 = self.weight2.view(self.num_local_experts, -1, self.config.hidden_size)
                 fc2_output = gg.ops.gmm(intermediate_parallel, w2, tokens_per_expert_cpu, trans_b=False)
                 self.weight_cache.release_group(1, copy_data=False)
@@ -1105,7 +1124,11 @@ class SequentialMLPFunction(torch.autograd.Function):
                 output_local_list.append(tokens)
                 continue
             # Swap only this expert's weights onto GPU for compute.
-            self.weight_cache.activate_group(expert_idx, training=self.training)
+            self.weight_cache.activate_group(
+                expert_idx, training=self.training, device=tokens.device
+            )
+            if any(p.device != tokens.device for p in expert.parameters()):
+                raise RuntimeError("Expert weights not on expected device after activate_group")
             if self.config.fp8 or self.config.fp4:
                 hidden, probs = SequentialMLP._pad_tensor_for_quantization(tokens, probs, self.config)
                 output, output_bias = expert(hidden, probs)
@@ -1137,7 +1160,11 @@ class SequentialMLPFunction(torch.autograd.Function):
                 grad_input_list.append(tokens)
                 continue
             # Swap only this expert's weights onto GPU for backward.
-            self.weight_cache.activate_group(expert_idx, training=True)
+            self.weight_cache.activate_group(
+                expert_idx, training=True, device=tokens.device
+            )
+            if any(p.device != tokens.device for p in expert.parameters()):
+                raise RuntimeError("Expert weights not on expected device after activate_group")
 
             with torch.enable_grad():
                 tokens_req = tokens.detach().requires_grad_(True)
