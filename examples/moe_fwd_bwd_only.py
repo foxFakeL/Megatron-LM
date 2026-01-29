@@ -11,6 +11,8 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.experts import SequentialMLP
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.utils import get_te_version
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.utils import get_ltor_masks_and_position_ids
 
@@ -160,6 +162,8 @@ def main() -> int:
     parser.add_argument("--moe-router-topk", type=int, default=8)
     parser.add_argument("--moe-token-dispatcher-type", type=str, default="alltoall")
     parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--use-flash-attn", action="store_true")
+    parser.add_argument("--use-transformer-engine", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--trace-offload", action="store_true")
     args = parser.parse_args()
@@ -181,6 +185,21 @@ def main() -> int:
     num_moe_experts = ep_size * args.num_local_experts
 
     bf16 = bool(args.bf16 and torch.cuda.is_bf16_supported())
+    if args.use_flash_attn and not bf16:
+        raise RuntimeError("FlashAttention requires --bf16 in this script.")
+    if args.use_flash_attn:
+        head_dim = args.hidden_size // args.num_attention_heads
+        if args.hidden_size % args.num_attention_heads != 0:
+            raise RuntimeError("hidden_size must be divisible by num_attention_heads.")
+        if head_dim > 256:
+            raise RuntimeError(
+                f"FlashAttention requires head_dim <= 256, got {head_dim}. "
+                "Increase num_attention_heads or reduce hidden_size."
+            )
+
+    use_transformer_engine = args.use_transformer_engine or args.use_flash_attn
+    if use_transformer_engine and get_te_version() is None:
+        raise RuntimeError("Transformer Engine is required for FlashAttention backend.")
     params_dtype = torch.bfloat16 if bf16 else torch.float32
 
     config = TransformerConfig(
@@ -204,9 +223,12 @@ def main() -> int:
         sequence_parallel=False,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        attention_backend=AttnBackend.flash if args.use_flash_attn else AttnBackend.auto,
     )
 
-    transformer_layer_spec = get_gpt_decoder_block_spec(config, use_transformer_engine=False)
+    transformer_layer_spec = get_gpt_decoder_block_spec(
+        config, use_transformer_engine=use_transformer_engine
+    )
 
     model = GPTModel(
         config=config,

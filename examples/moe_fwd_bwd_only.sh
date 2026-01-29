@@ -15,14 +15,18 @@ torchrun \
   --nproc_per_node "${NPROC_PER_NODE}" \
   "${SCRIPT_DIR}/moe_fwd_bwd_only.py" \
   --iters 1 \
-  --micro-batch-size 2 \
-  --seq-length 64 \
+  --micro-batch-size 1 \
+  --seq-length 50000 \
   --vocab-size 128 \
   --num-layers 5 \
   --hidden-size 2048 \
   --ffn-hidden-size 10240 \
-  --num-attention-heads 4 \
+  --num-attention-heads 8 \
+  --bf16 \
+  --use-transformer-engine \
+  --use-flash-attn \
   --num-local-experts 64 \
   --moe-router-topk 8 \
   --moe-token-dispatcher-type alltoall \
-  --trace-offload
+  --trace-offload \
+  --bf16
