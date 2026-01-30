@@ -9,8 +9,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 : "${NNODES:=1}"
 : "${NPROC_PER_NODE:=1}"
+: "${ENABLE_NSYS:=0}"
+: "${NSYS_OUT:=/workspace/nsys_moe_fwd_bwd}"
 
-torchrun \
+NSYS_CMD=()
+if [[ "${ENABLE_NSYS}" == "1" ]]; then
+  NSYS_CMD=(
+    nsys profile
+    -t cuda,nvtx,osrt
+    --force-overwrite=true
+    -o "${NSYS_OUT}"
+  )
+fi
+
+${NSYS_CMD[@]} torchrun \
   --nnodes "${NNODES}" \
   --nproc_per_node "${NPROC_PER_NODE}" \
   "${SCRIPT_DIR}/moe_fwd_bwd_only.py" \
@@ -19,9 +31,9 @@ torchrun \
   --seq-length 50000 \
   --vocab-size 128 \
   --num-layers 5 \
-  --hidden-size 2048 \
-  --ffn-hidden-size 10240 \
-  --num-attention-heads 8 \
+  --hidden-size 7168 \
+  --ffn-hidden-size 2408 \
+  --num-attention-heads 128 \
   --bf16 \
   --use-transformer-engine \
   --use-flash-attn \

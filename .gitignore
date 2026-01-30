@@ -22,3 +22,6 @@ docs/_build
 docs/apidocs
 *.pickle
 *.json
+*.nsys-rep
+*.sqlite
+*.log
