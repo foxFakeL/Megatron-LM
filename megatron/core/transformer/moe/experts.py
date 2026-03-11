@@ -194,9 +194,9 @@ class ExpertWeightCache:
         entry = self._entries[entry_idx]
 
         if entry.grad_buffer is None or entry.grad_buffer.shape != grad.shape:
-            # Keep a stable CPU tensor to reduce reallocations.
-            entry.grad_buffer = torch.empty_like(grad, device='cpu')
-        entry.grad_buffer.copy_(grad.detach().to('cpu'))
+            # Keep a stable pinned CPU tensor to reduce reallocations.
+            entry.grad_buffer = torch.empty_like(grad, device='cpu', pin_memory=True)
+        entry.grad_buffer.copy_(grad.detach(), non_blocking=True)
         # Only attach CPU grads once the parameter data is on CPU.
         if entry.param.device.type == 'cpu':
             entry.param.grad = entry.grad_buffer
@@ -258,7 +258,8 @@ class ExpertWeightCache:
     def _offload_entry(self, entry: _ExpertWeightCacheEntry, copy_data: bool):
         if entry.param.device.type != "cpu":
             if copy_data:
-                entry.cpu_buffer.copy_(entry.param.data.detach().to('cpu'))
+                # Use non_blocking copy with pinned memory for faster GPU->CPU transfer
+                entry.cpu_buffer.copy_(entry.param.data.detach(), non_blocking=True)
             entry.param.data = entry.cpu_buffer
             entry.device = entry.cpu_buffer.device
         entry.is_loaded = False
@@ -310,7 +311,14 @@ class ExpertWeightCache:
                 # Wait for rank 0 to finish copying before anyone uses it
                 torch.distributed.barrier(group=ep_group)
             else:
-                cpu_buffer = param.detach().to('cpu').contiguous()
+                # Create pinned memory buffer for faster CPU<->GPU transfers
+                cpu_buffer = torch.empty(
+                    param.shape, dtype=param.dtype, device='cpu', pin_memory=True
+                )
+                if param.device.type == 'cuda':
+                    cpu_buffer.copy_(param.data.detach(), non_blocking=True)
+                else:
+                    cpu_buffer.copy_(param.data.detach())
 
             param.data = cpu_buffer
             self._param_to_entry_idx[id(param)] = len(entries)
@@ -325,11 +333,13 @@ class ExpertWeightCache:
         self._entries = entries
 
     def prime_cpu_storage(self):
-        """Ensure parameters start on CPU until explicitly loaded."""
+        """Ensure parameters start on CPU until explicitly loaded.
+        
+        Uses pinned memory for faster CPU<->GPU transfers during expert weight swapping.
+        """
         if not self.enabled:
             return
         self._maybe_initialize_entries()
-        # Note: Pinning memory removed to avoid precision differences
 
 
 
