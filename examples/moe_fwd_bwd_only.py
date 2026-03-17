@@ -166,6 +166,8 @@ def main() -> int:
     parser.add_argument("--use-transformer-engine", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--trace-offload", action="store_true")
+    parser.add_argument("--activation-offload", action="store_true",
+                        help="Enable MoE input activation offload to CPU")
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -215,6 +217,7 @@ def main() -> int:
         moe_token_dispatcher_type=args.moe_token_dispatcher_type,
         moe_grouped_gemm=False,
         moe_enable_expert_weight_cache=True,
+        moe_activation_offload=args.activation_offload,
         use_cpu_initialization=True,
         bf16=bf16,
         params_dtype=params_dtype,
@@ -260,7 +263,8 @@ def main() -> int:
             print(
                 f"Running fwd+bwd only: iters={args.iters} world={world_size} "
                 f"experts={num_moe_experts} local_experts={args.num_local_experts} "
-                f"dtype={'bf16' if bf16 else 'fp32'}",
+                f"dtype={'bf16' if bf16 else 'fp32'} "
+                f"activation_offload={args.activation_offload}",
                 flush=True,
             )
 
@@ -322,7 +326,6 @@ def main() -> int:
 
     return 0
 
-import json
 
 if __name__ == "__main__":
     try:
@@ -331,3 +334,4 @@ if __name__ == "__main__":
     finally:
         torch.cuda.memory._dump_snapshot("moe_fwd_bwd_only_memory_snapshot.pickle")
         torch.cuda.memory._record_memory_history(enabled=None)
+    # main()

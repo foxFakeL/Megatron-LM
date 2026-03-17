@@ -12,6 +12,7 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
+from torch.cuda import nvtx
 from torch.nn.parameter import Parameter
 
 from megatron.core import tensor_parallel
@@ -1117,16 +1118,80 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
 
+class ActivationCache:
+    """Cache for input activations on CPU, similar to ExpertWeightCache.
+
+    This class handles offloading MoE input activations to CPU during forward pass
+    and loading them back to GPU during backward pass, reducing GPU memory usage.
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        self._cpu_buffer: Optional[torch.Tensor] = None
+        self._shape: Optional[Tuple[int, ...]] = None
+        self._dtype: Optional[torch.dtype] = None
+
+    def offload_to_cpu(self, tensor: torch.Tensor) -> None:
+        """Copy tensor to pinned CPU memory.
+
+        Args:
+            tensor: The GPU tensor to offload to CPU.
+        """
+        if not self.enabled:
+            return
+        if self._cpu_buffer is None or self._cpu_buffer.shape != tensor.shape:
+            self._cpu_buffer = torch.empty_like(
+                tensor.detach(), device='cpu', pin_memory=True
+            )
+        self._cpu_buffer.copy_(tensor.detach(), non_blocking=True)
+        self._shape = tensor.shape
+        self._dtype = tensor.dtype
+
+    def load_to_device(self, device: torch.device, non_blocking: bool = True) -> torch.Tensor:
+        """Load tensor from CPU to GPU.
+
+        Args:
+            device: The target GPU device.
+            non_blocking: Whether to perform async transfer.
+
+        Returns:
+            The tensor loaded to the specified device.
+        """
+        if not self.enabled or self._cpu_buffer is None:
+            raise RuntimeError("No activation cached")
+        return self._cpu_buffer.to(device, non_blocking=non_blocking)
+
+    def clear(self) -> None:
+        """Clear the cached activation."""
+        self._cpu_buffer = None
+        self._shape = None
+        self._dtype = None
+
+    @property
+    def is_cached(self) -> bool:
+        """Check if there is a cached activation."""
+        return self._cpu_buffer is not None
+
+
 class SequentialMLPFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, self, permuted_local_hidden_states, tokens_per_expert, permuted_probs):
         ctx.self = self
-        ctx.save_for_backward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+
+        # Offload activation to CPU if enabled, otherwise save to GPU
+        if self.activation_offload:
+            self.activation_cache.offload_to_cpu(permuted_local_hidden_states)
+            ctx.save_for_backward(tokens_per_expert, permuted_probs)
+            ctx.activation_offloaded = True
+        else:
+            ctx.save_for_backward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
+            ctx.activation_offloaded = False
 
         tokens_per_expert_list = tokens_per_expert.tolist()
         tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert_list)
         probs_list = torch.split(permuted_probs, tokens_per_expert_list)
         output_local_list = []
+        nvtx.range_push("SequentialMLP::forward")
         for expert_idx, (expert, tokens, probs) in enumerate(
             zip(self.local_experts, tokens_list, probs_list)
         ):
@@ -1134,35 +1199,54 @@ class SequentialMLPFunction(torch.autograd.Function):
                 output_local_list.append(tokens)
                 continue
             # Swap only this expert's weights onto GPU for compute.
+            nvtx.range_push(f"expert_{expert_idx}_activate")
             self.weight_cache.activate_group(
                 expert_idx, training=self.training, device=tokens.device
             )
+            nvtx.range_pop()
             if any(p.device != tokens.device for p in expert.parameters()):
                 raise RuntimeError("Expert weights not on expected device after activate_group")
             if self.config.fp8 or self.config.fp4:
                 hidden, probs = SequentialMLP._pad_tensor_for_quantization(tokens, probs, self.config)
+                nvtx.range_push(f"expert_{expert_idx}_compute")
                 output, output_bias = expert(hidden, probs)
+                nvtx.range_pop()
                 output = output[: tokens.shape[0]]
             else:
+                nvtx.range_push(f"expert_{expert_idx}_compute")
                 output, output_bias = expert(tokens, probs)
+                nvtx.range_pop()
             # Release weights immediately after this expert finishes.
+            nvtx.range_push(f"expert_{expert_idx}_release")
             self.weight_cache.release_group(expert_idx, copy_data=False)
+            nvtx.range_pop()
             output_local_list.append(output)
 
         output_local = torch.cat(output_local_list, dim=0)
+        nvtx.range_pop()
         output_bias_local = None
         return output_local, output_bias_local
 
     @staticmethod
     def backward(ctx, grad_output, grad_bias):
         self = ctx.self
-        permuted_local_hidden_states, tokens_per_expert, permuted_probs = ctx.saved_tensors
+
+        # Load activation from CPU if it was offloaded, otherwise use saved tensor
+        if ctx.activation_offloaded:
+            tokens_per_expert, permuted_probs = ctx.saved_tensors
+            permuted_local_hidden_states = self.activation_cache.load_to_device(
+                grad_output.device, non_blocking=True
+            )
+        else:
+            permuted_local_hidden_states, tokens_per_expert, permuted_probs = ctx.saved_tensors
+
         tokens_per_expert_list = tokens_per_expert.tolist()
         tokens_list = torch.split(permuted_local_hidden_states, tokens_per_expert_list)
         probs_list = torch.split(permuted_probs, tokens_per_expert_list)
         grad_list = torch.split(grad_output, tokens_per_expert_list)
 
         grad_input_list: List[torch.Tensor] = []
+        nvtx.range_push("SequentialMLP::backward")
         for expert_idx, (expert, tokens, probs, grad) in enumerate(
             zip(self.local_experts, tokens_list, probs_list, grad_list)
         ):
@@ -1170,12 +1254,15 @@ class SequentialMLPFunction(torch.autograd.Function):
                 grad_input_list.append(tokens)
                 continue
             # Swap only this expert's weights onto GPU for backward.
+            nvtx.range_push(f"expert_{expert_idx}_activate")
             self.weight_cache.activate_group(
                 expert_idx, training=True, device=tokens.device
             )
+            nvtx.range_pop()
             if any(p.device != tokens.device for p in expert.parameters()):
                 raise RuntimeError("Expert weights not on expected device after activate_group")
 
+            nvtx.range_push(f"expert_{expert_idx}_bwd_compute")
             with torch.enable_grad():
                 tokens_req = tokens.detach().requires_grad_(True)
                 probs_const = probs.detach()
@@ -1200,8 +1287,10 @@ class SequentialMLPFunction(torch.autograd.Function):
 
             grad_tokens = grads[0]
             grad_params = grads[1:]
+            nvtx.range_pop()
 
             # Release weights first so params are back on CPU before attaching CPU grads.
+            nvtx.range_push(f"expert_{expert_idx}_release")
             self.weight_cache.release_group(expert_idx, copy_data=False)
 
             # Offload expert parameter grads to CPU.
@@ -1209,10 +1298,12 @@ class SequentialMLPFunction(torch.autograd.Function):
                 if g is None:
                     continue
                 self.weight_cache.offload_param_grad_to_cpu(p, g)
+            nvtx.range_pop()
 
             grad_input_list.append(grad_tokens)
 
         grad_input = torch.cat(grad_input_list, dim=0)
+        nvtx.range_pop()
         return None, grad_input, None, None  # self, permuted_local_hidden_states, tokens_per_expert, permuted_probs
 
 
@@ -1269,6 +1360,13 @@ class SequentialMLP(MegatronModule):
         )
         if self.weight_cache.enabled:
             self.weight_cache.prime_cpu_storage()
+
+        # Add activation offload support
+        self.activation_offload = (
+            getattr(self.config, "moe_activation_offload", False)
+            and cache_enabled
+        )
+        self.activation_cache = ActivationCache(enabled=self.activation_offload)
 
     @staticmethod
     def _pad_tensor_for_quantization(hidden, probs, config):

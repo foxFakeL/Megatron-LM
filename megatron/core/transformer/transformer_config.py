@@ -648,10 +648,17 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
     moe_flex_dispatcher_backend: str = "deepep"
-    moe_enable_expert_weight_cache: bool = True
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
+    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports
     the MNNVL case."""
+
+    moe_enable_expert_weight_cache: bool = True
+    """[Experimental] Enable caching expert weights on CPU and swapping them to GPU on demand."""
+
+    moe_activation_offload: bool = False
+    """[Experimental] Offload MoE input activations to CPU during forward pass.
+    When enabled together with moe_enable_expert_weight_cache, both activations and
+    expert weights are swapped in together during backward pass for memory efficiency."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
