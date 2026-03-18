@@ -1464,3 +1464,475 @@ class SequentialMLP(MegatronModule):
 
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict
+
+class CacheGroupedMLP(MegatronModule):
+    """An implementation of the Experts layer using GroupedGEMM with expert weight caching.
+
+    This class supports:
+    - Only EP (Expert Parallelism), no TP (Tensor Parallelism)
+    - Each rank can access all global experts (no local_expert_ids concept)
+    - Forward takes expert_sets - multiple expert subsets, processed one by one
+    - All expert weights stored in CPU shared memory (EP group shared)
+    - Optional activation offload to reduce GPU memory usage
+
+    Simplified design: No ExpertWeightCache dependency, directly manages shared memory.
+    """
+
+    def __init__(
+        self,
+        num_global_experts: int,
+        config: TransformerConfig,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        super().__init__(config=config)
+        self.config: TransformerConfig = config
+        self.num_global_experts = num_global_experts
+        gg.assert_grouped_gemm_is_available()
+
+        # No TP support - only EP
+        assert config.add_bias_linear == False, ( 
+            "bias not supported in Grouped GEMM, please set '--disable-bias-linear' instead."
+        )
+        assert config.moe_latent_size is None, (
+            "MoE latent projection not supported in CacheGroupedMLP."
+        )
+
+        self.ep_group = pg_collection.ep if pg_collection else None
+        self.ep_size = self.ep_group.size() if self.ep_group else 1
+        self.ep_rank = torch.distributed.get_rank(self.ep_group) if self.ep_group else 0
+
+        # Setup activation function
+        if self.config.gated_linear_unit:
+            if self.config.activation_func not in (F.silu, F.gelu):
+                raise ValueError("Activation function must be silu or gelu when using CacheGroupedMLP.")
+
+            def glu(x):
+                x = torch.chunk(x, 2, dim=-1)
+                return self.config.activation_func(x[0]) * x[1]
+
+            self.activation_func = glu
+        else:
+            self.activation_func = self.config.activation_func
+
+        # Note: We don't use jit_fuser here to avoid device propagation issues
+        # with dynamically loaded weights. Instead, the activation is applied
+        # directly in the forward pass.
+        self.activation_func_with_probs = None  # Set to None, handled in forward
+
+        # Calculate weight shapes
+        # weight1: [num_global_experts, hidden_size, ffn_hidden_size * (2 if glu else 1)]
+        # weight2: [num_global_experts, ffn_hidden_size, hidden_size]
+        hidden_size = self.config.hidden_size
+        ffn_hidden_size = self.config.moe_ffn_hidden_size
+
+        fc1_out_features = ffn_hidden_size
+        if self.config.gated_linear_unit:
+            fc1_out_features *= 2
+
+        # Use shared memory for EP multi-rank, pinned memory for single rank
+        use_shm = self.ep_group is not None and self.ep_size > 1
+        self._shm_w1: Optional[shm.SharedMemory] = None
+        self._shm_w2: Optional[shm.SharedMemory] = None
+
+        if use_shm:
+            # Shared memory approach - rank 0 creates, others attach
+            ep_ranks = torch.distributed.get_process_group_ranks(self.ep_group)
+            base_rank = min(ep_ranks)
+            is_rank_0 = (self.ep_rank == 0)
+
+            # weight1 shared memory
+            shm_name_w1 = f"megatron_moe_w1_r{base_rank}"
+            size_w1 = num_global_experts * hidden_size * fc1_out_features * config.params_dtype.itemsize
+
+            if is_rank_0:
+                # Clean up any existing shared memory
+                try:
+                    shm.SharedMemory(name=shm_name_w1).unlink()
+                except FileNotFoundError:
+                    pass
+                self._shm_w1 = shm.SharedMemory(create=True, size=size_w1, name=shm_name_w1)
+
+            # Ensure rank 0 has created the segment before others attach
+            torch.distributed.barrier(group=self.ep_group)
+
+            if not is_rank_0:
+                self._shm_w1 = shm.SharedMemory(name=shm_name_w1)
+
+            weight1_data = torch.frombuffer(
+                self._shm_w1.buf, dtype=config.params_dtype
+            ).view(num_global_experts, hidden_size, fc1_out_features)
+
+            # weight2 shared memory
+            shm_name_w2 = f"megatron_moe_w2_r{base_rank}"
+            size_w2 = num_global_experts * ffn_hidden_size * hidden_size * config.params_dtype.itemsize
+
+            if is_rank_0:
+                try:
+                    shm.SharedMemory(name=shm_name_w2).unlink()
+                except FileNotFoundError:
+                    pass
+                self._shm_w2 = shm.SharedMemory(create=True, size=size_w2, name=shm_name_w2)
+
+            torch.distributed.barrier(group=self.ep_group)
+
+            if not is_rank_0:
+                self._shm_w2 = shm.SharedMemory(name=shm_name_w2)
+
+            weight2_data = torch.frombuffer(
+                self._shm_w2.buf, dtype=config.params_dtype
+            ).view(num_global_experts, ffn_hidden_size, hidden_size)
+
+            # Initialize weights only on rank 0
+            if config.perform_initialization and is_rank_0:
+                with torch.no_grad():
+                    for i in range(num_global_experts):
+                        config.init_method(weight1_data[i])
+                        config.output_layer_init_method(weight2_data[i])
+
+            # Wait for rank 0 to finish initialization
+            torch.distributed.barrier(group=self.ep_group)
+        else:
+            # Single rank: use pinned memory for faster transfers
+            weight1_data = torch.empty(
+                num_global_experts, hidden_size, fc1_out_features,
+                dtype=config.params_dtype, device='cpu', pin_memory=True
+            )
+            weight2_data = torch.empty(
+                num_global_experts, ffn_hidden_size, hidden_size,
+                dtype=config.params_dtype, device='cpu', pin_memory=True
+            )
+
+            if config.perform_initialization:
+                with torch.no_grad():
+                    for i in range(num_global_experts):
+                        config.init_method(weight1_data[i])
+                        config.output_layer_init_method(weight2_data[i])
+
+        # Create Parameter (data is in shared memory or pinned memory)
+        self.weight1 = Parameter(weight1_data)
+        self.weight2 = Parameter(weight2_data)
+
+        # Gradient buffers (shared memory for EP, pinned memory for single rank)
+        self._grad_weight1: Optional[torch.Tensor] = torch.zeros_like(weight1_data)
+        self._grad_weight2: Optional[torch.Tensor] = torch.zeros_like(weight2_data)
+
+        # Setup activation offload
+        cache_enabled = getattr(self.config, "moe_enable_expert_weight_cache", True)
+        self.activation_offload = (
+            getattr(self.config, "moe_activation_offload", False)
+            and cache_enabled
+        )
+        self.activation_cache = ActivationCache(enabled=self.activation_offload)
+
+    def _load_expert_weights(
+        self,
+        expert_ids: List[int],
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Load specified experts' weights to GPU.
+
+        Args:
+            expert_ids: List of global expert IDs to load
+            device: Target GPU device
+
+        Returns:
+            Tuple of (weight1_gpu, weight2_gpu) with shape [num_experts, ...]
+        """
+        # Get weights for specified experts
+        w1 = self.weight1.data[expert_ids]  # [num_experts, hidden, ffn*2]
+        w2 = self.weight2.data[expert_ids]  # [num_experts, ffn, hidden]
+
+        # Transfer to GPU
+        w1_gpu = w1.to(device, non_blocking=True)
+        w2_gpu = w2.to(device, non_blocking=True)
+
+        return w1_gpu, w2_gpu
+
+    def _offload_grads_to_cpu(
+        self,
+        expert_ids: List[int],
+        grad_w1: torch.Tensor,
+        grad_w2: torch.Tensor,
+    ):
+        """Offload gradients to CPU and accumulate in shared buffers.
+
+        Args:
+            expert_ids: List of global expert IDs
+            grad_w1: Gradient for weight1 on GPU
+            grad_w2: Gradient for weight2 on GPU
+
+        Note:
+            With external scheduling, each expert is computed by exactly one rank,
+            so we don't need any synchronization here.
+        """
+        # Offload gradients to CPU
+        grad_w1_cpu = grad_w1.detach().to('cpu', non_blocking=True)
+        grad_w2_cpu = grad_w2.detach().to('cpu', non_blocking=True)
+
+        # Accumulate gradients for specified experts
+        for i, expert_id in enumerate(expert_ids):
+            self._grad_weight1[expert_id].add_(grad_w1_cpu[i])
+            self._grad_weight2[expert_id].add_(grad_w2_cpu[i])
+
+    def sync_gradients(self):
+        """Synchronize accumulated gradients to parameters.
+
+        This should be called after backward pass to apply the CPU gradients
+        to the parameter's .grad attribute for the optimizer.
+
+        Note:
+            With external scheduling (each expert computed by one rank), no
+            allreduce is needed. Gradients are directly attached to parameters.
+        """
+        self.weight1.grad = self._grad_weight1
+        self.weight2.grad = self._grad_weight2
+
+    def zero_grad(self, set_to_none: bool = False):
+        """Clear gradient buffers."""
+        super().zero_grad(set_to_none)
+        # Zero the gradient buffers
+        if self._grad_weight1 is not None:
+            self._grad_weight1.zero_()
+        if self._grad_weight2 is not None:
+            self._grad_weight2.zero_()
+
+    def release(self):
+        """Release shared memory resources."""
+        is_rank_0 = self.ep_group is None or self.ep_rank == 0
+
+        if self._shm_w1 is not None:
+            self._shm_w1.close()
+            if is_rank_0:
+                try:
+                    self._shm_w1.unlink()
+                except FileNotFoundError:
+                    pass
+            self._shm_w1 = None
+
+        if self._shm_w2 is not None:
+            self._shm_w2.close()
+            if is_rank_0:
+                try:
+                    self._shm_w2.unlink()
+                except FileNotFoundError:
+                    pass
+            self._shm_w2 = None
+
+        self._grad_weight1 = None
+        self._grad_weight2 = None
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        tokens_per_expert_per_set: List[torch.Tensor],
+        probs_per_set: List[torch.Tensor],
+        expert_sets: List[List[int]],
+    ) -> Tuple[torch.Tensor, None]:
+        """Forward pass processing expert sets sequentially.
+
+        Args:
+            hidden_states: All tokens concatenated [total_tokens, hidden_size]
+            tokens_per_expert_per_set: Token count per expert per set
+            probs_per_set: Probability per token per set
+            expert_sets: List of expert ID lists [[e1,e2], [e3,e4], ...]
+
+        Returns:
+            Tuple of (output, None) where output is [total_tokens, hidden_size]
+        """
+        return CacheGroupedMLPFunction.apply(
+            self, hidden_states, tokens_per_expert_per_set, probs_per_set, expert_sets
+        )
+
+    def backward_dw(self):
+        """Performs backward pass for weight gradients.
+        Empty implementation for compatibility.
+        """
+        pass
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Return sharded state dict for checkpointing."""
+        # TODO: Implement checkpoint support if needed
+        del prefix, sharded_offsets, metadata  # Unused
+        raise NotImplementedError(
+            "CacheGroupedMLP does not support checkpoint save/load yet."
+        )
+
+
+class CacheGroupedMLPFunction(torch.autograd.Function):
+    """Custom autograd function for CacheGroupedMLP with weight swapping."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        self: CacheGroupedMLP,
+        hidden_states: torch.Tensor,
+        tokens_per_expert_per_set: List[torch.Tensor],
+        probs_per_set: List[torch.Tensor],
+        expert_sets: List[List[int]],
+    ):
+        ctx.self = self
+        ctx.expert_sets = expert_sets
+        ctx.num_sets = len(expert_sets)
+
+        # Offload activation to CPU if enabled
+        if self.activation_offload:
+            self.activation_cache.offload_to_cpu(hidden_states)
+            ctx.save_for_backward(*tokens_per_expert_per_set, *probs_per_set)
+            ctx.activation_offloaded = True
+        else:
+            ctx.save_for_backward(hidden_states, *tokens_per_expert_per_set, *probs_per_set)
+            ctx.activation_offloaded = False
+
+        device = hidden_states.device
+        output_list = []
+        token_offset = 0
+
+        nvtx.range_push("CacheGroupedMLP::forward")
+
+        for set_idx, expert_ids in enumerate(expert_sets):
+            tokens_per_expert = tokens_per_expert_per_set[set_idx]
+            probs = probs_per_set[set_idx]
+            num_tokens = int(tokens_per_expert.sum().item())
+
+            if num_tokens == 0:
+                continue
+
+            # Extract current set's hidden states
+            set_hidden_states = hidden_states[token_offset:token_offset + num_tokens]
+            token_offset += num_tokens
+
+            # Load weights for this set
+            w1_gpu, w2_gpu = self._load_expert_weights(expert_ids, device)
+
+            # Ensure tokens_per_expert is on CPU for GroupedGEMM
+            tokens_per_expert_cpu = tokens_per_expert.cpu()
+
+            # Move probs to GPU
+            probs_gpu = probs.to(device, non_blocking=True)
+
+            # GroupedGEMM: fc1
+            fc1_output = gg.ops.gmm(
+                set_hidden_states, w1_gpu, tokens_per_expert_cpu, trans_b=False
+            )
+
+            # Activation with probs
+            intermediate = self.activation_func(fc1_output) * probs_gpu.unsqueeze(-1)
+
+            # GroupedGEMM: fc2
+            fc2_output = gg.ops.gmm(
+                intermediate, w2_gpu, tokens_per_expert_cpu, trans_b=False
+            )
+
+            output_list.append(fc2_output)
+
+        nvtx.range_pop()
+
+        output = torch.cat(output_list, dim=0) if output_list else torch.empty(
+            0, self.config.hidden_size, device=device, dtype=hidden_states.dtype
+        )
+
+        return output, None
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor, grad_bias):
+        """Backward pass.
+
+        Args:
+            ctx: Autograd context
+            grad_output: Gradient of output
+            grad_bias: Gradient of bias (always None since bias is not supported)
+        """
+        del grad_bias  # Unused - bias not supported
+        self: CacheGroupedMLP = ctx.self
+        expert_sets: List[List[int]] = ctx.expert_sets
+        num_sets: int = ctx.num_sets
+
+        # Load activation from CPU if offloaded, otherwise use saved tensor
+        if ctx.activation_offloaded:
+            saved_tensors = ctx.saved_tensors
+            tokens_per_expert_per_set = list(saved_tensors[:num_sets])
+            probs_per_set = list(saved_tensors[num_sets:2*num_sets])
+            hidden_states = self.activation_cache.load_to_device(
+                grad_output.device, non_blocking=True
+            )
+        else:
+            saved_tensors = ctx.saved_tensors
+            hidden_states = saved_tensors[0]
+            tokens_per_expert_per_set = list(saved_tensors[1:num_sets+1])
+            probs_per_set = list(saved_tensors[num_sets+1:2*num_sets+1])
+
+        device = grad_output.device
+        grad_input_list = []
+        token_offset = 0
+        grad_offset = 0
+
+        nvtx.range_push("CacheGroupedMLP::backward")
+
+        for set_idx, expert_ids in enumerate(expert_sets):
+            tokens_per_expert = tokens_per_expert_per_set[set_idx]
+            probs = probs_per_set[set_idx]
+            num_tokens = int(tokens_per_expert.sum().item())
+
+            if num_tokens == 0:
+                continue
+
+            # Extract current set's data
+            set_hidden_states = hidden_states[token_offset:token_offset + num_tokens]
+            set_grad_output = grad_output[grad_offset:grad_offset + num_tokens]
+            token_offset += num_tokens
+            grad_offset += num_tokens
+
+            # Load weights for this set
+            w1_gpu, w2_gpu = self._load_expert_weights(expert_ids, device)
+
+            # Recompute forward with gradients
+            tokens_per_expert_cpu = tokens_per_expert.cpu()
+
+            # Move probs to GPU
+            probs_gpu = probs.to(device, non_blocking=True)
+
+            with torch.enable_grad():
+                # Detach and require grad for recomputation
+                set_hidden_states_req = set_hidden_states.detach().requires_grad_(True)
+                w1_gpu_req = w1_gpu.detach().requires_grad_(True)
+                w2_gpu_req = w2_gpu.detach().requires_grad_(True)
+
+                # Forward
+                fc1_output = gg.ops.gmm(
+                    set_hidden_states_req, w1_gpu_req, tokens_per_expert_cpu, trans_b=False
+                )
+                intermediate = self.activation_func(fc1_output) * probs_gpu.unsqueeze(-1)
+                fc2_output = gg.ops.gmm(
+                    intermediate, w2_gpu_req, tokens_per_expert_cpu, trans_b=False
+                )
+
+                # Compute gradients
+                grads = torch.autograd.grad(
+                    outputs=fc2_output,
+                    inputs=(set_hidden_states_req, w1_gpu_req, w2_gpu_req),
+                    grad_outputs=set_grad_output,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=False,
+                )
+
+                grad_input = grads[0]
+                grad_w1 = grads[1]
+                grad_w2 = grads[2]
+
+            # Offload gradients to CPU
+            self._offload_grads_to_cpu(expert_ids, grad_w1, grad_w2)
+
+            grad_input_list.append(grad_input)
+
+        nvtx.range_pop()
+
+        if grad_input_list:
+            grad_input = torch.cat(grad_input_list, dim=0)
+        else:
+            grad_input = torch.empty(
+                0, self.config.hidden_size, device=device, dtype=grad_output.dtype
+            )
+
+        # Return gradients: (self, hidden_states, tokens_per_expert_per_set, probs_per_set, expert_sets)
+        return None, grad_input, None, None, None
