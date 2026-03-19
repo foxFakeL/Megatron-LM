@@ -1613,8 +1613,8 @@ class CacheGroupedMLP(MegatronModule):
         self.weight2 = Parameter(weight2_data)
 
         # Gradient buffers (shared memory for EP, pinned memory for single rank)
-        self._grad_weight1: Optional[torch.Tensor] = torch.zeros_like(weight1_data)
-        self._grad_weight2: Optional[torch.Tensor] = torch.zeros_like(weight2_data)
+        self._grad_weight1: Optional[torch.Tensor] = torch.zeros_like(weight1_data, pin_memory=True)
+        self._grad_weight2: Optional[torch.Tensor] = torch.zeros_like(weight2_data, pin_memory=True)
 
         # Setup activation offload
         cache_enabled = getattr(self.config, "moe_enable_expert_weight_cache", True)
@@ -1623,28 +1623,53 @@ class CacheGroupedMLP(MegatronModule):
             and cache_enabled
         )
         self.activation_cache = ActivationCache(enabled=self.activation_offload)
+        
+        # pin mem buffer for forward expert load
+        self._w1_h2d_pinned_buffer = torch.empty(
+            num_global_experts, hidden_size, fc1_out_features,
+            dtype=config.params_dtype, device='cpu', pin_memory=True
+        )
+        self._w2_h2d_pinned_buffer = torch.empty(
+            num_global_experts, ffn_hidden_size, hidden_size,
+            dtype=config.params_dtype, device='cpu', pin_memory=True
+        )
+        
+        # GPU mem buffer for forward expert load
+        device = torch.cuda.current_device()
+        self._w1_gpu_workspace = torch.empty(
+            8, hidden_size, fc1_out_features,
+            dtype=config.params_dtype, device=device
+        )
+        self._w2_gpu_workspace = torch.empty(
+            8, ffn_hidden_size, hidden_size,
+            dtype=config.params_dtype, device=device
+        )
+        
+    def _load_expert_weights(self, expert_ids: List[int], device: torch.device):
+        num_experts = len(expert_ids)
+        
+        # 1. CPU -> CPU 聚合（Pageable to Pinned）
+        # 将共享内存中散落的专家权重，拷贝到连续的锁页内存中
+        # 这一步是 CPU 内部的拷贝，速度极快（受限于内存带宽），且不会阻塞 GPU
+        for i, exp_id in enumerate(expert_ids):
+            self._w1_h2d_pinned_buffer[i].copy_(self.weight1.data[exp_id])
+            self._w2_h2d_pinned_buffer[i].copy_(self.weight2.data[exp_id])
 
-    def _load_expert_weights(
-        self,
-        expert_ids: List[int],
-        device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Load specified experts' weights to GPU.
+        # 获取当前需要用到的连续内存视图 (View)，不产生实际拷贝
+        w1_pinned_view = self._w1_h2d_pinned_buffer[:num_experts]
+        w2_pinned_view = self._w2_h2d_pinned_buffer[:num_experts]
 
-        Args:
-            expert_ids: List of global expert IDs to load
-            device: Target GPU device
+        # # 2. 在 GPU 上预分配空间
+        # # 注意：如果想极致优化，GPU 端也可以像 Pinned Buffer 一样做预分配和复用，避免每次 empty
+        # w1_gpu = torch.empty(num_experts, self.weight1.size(1), self.weight1.size(2), device=device, dtype=self.weight1.dtype)
+        # w2_gpu = torch.empty(num_experts, self.weight2.size(1), self.weight2.size(2), device=device, dtype=self.weight2.dtype)
+        w1_gpu = self._w1_gpu_workspace[:num_experts]
+        w2_gpu = self._w2_gpu_workspace[:num_experts]
 
-        Returns:
-            Tuple of (weight1_gpu, weight2_gpu) with shape [num_experts, ...]
-        """
-        # Get weights for specified experts
-        w1 = self.weight1.data[expert_ids]  # [num_experts, hidden, ffn*2]
-        w2 = self.weight2.data[expert_ids]  # [num_experts, ffn, hidden]
-
-        # Transfer to GPU
-        w1_gpu = w1.to(device, non_blocking=True)
-        w2_gpu = w2.to(device, non_blocking=True)
+        # 3. CPU -> GPU 单次、大块、异步传输 (Pinned to VRAM)
+        # 因为源端是真正的锁页内存，这里非阻塞传输会完美生效，nsys 里只会看到一条宽阔的绿带
+        w1_gpu.copy_(w1_pinned_view, non_blocking=True)
+        w2_gpu.copy_(w2_pinned_view, non_blocking=True)
 
         return w1_gpu, w2_gpu
 
@@ -1654,25 +1679,27 @@ class CacheGroupedMLP(MegatronModule):
         grad_w1: torch.Tensor,
         grad_w2: torch.Tensor,
     ):
-        """Offload gradients to CPU and accumulate in shared buffers.
+        """Offload gradients to CPU efficiently using a Pinned Memory staging buffer."""
+        
+        grad_w1_pinned = torch.empty_like(grad_w1, device='cpu', pin_memory=True)
+        grad_w2_pinned = torch.empty_like(grad_w2, device='cpu', pin_memory=True)
 
-        Args:
-            expert_ids: List of global expert IDs
-            grad_w1: Gradient for weight1 on GPU
-            grad_w2: Gradient for weight2 on GPU
+        # 2. 异步、整块地将 GPU 梯度拉回到 Pinned Memory
+        # non_blocking=True 只有在目标是 Pinned Memory 时才会真正生效！
+        grad_w1_pinned.copy_(grad_w1, non_blocking=True)
+        grad_w2_pinned.copy_(grad_w2, non_blocking=True)
 
-        Note:
-            With external scheduling, each expert is computed by exactly one rank,
-            so we don't need any synchronization here.
-        """
-        # Offload gradients to CPU
-        grad_w1_cpu = grad_w1.detach().to('cpu', non_blocking=True)
-        grad_w2_cpu = grad_w2.detach().to('cpu', non_blocking=True)
+        # 3. 等待这段异步拷贝完成，释放 GPU 去做其他算子的反向传播
+        torch.cuda.current_stream().synchronize()
 
-        # Accumulate gradients for specified experts
+        # 4. 在纯 CPU 侧，将数据从 Pinned Buffer 赋值 (copy_) 到 Shared Memory
+        # 因为在你的设计中每个专家只计算一次，所以直接覆盖即可
         for i, expert_id in enumerate(expert_ids):
-            self._grad_weight1[expert_id].add_(grad_w1_cpu[i])
-            self._grad_weight2[expert_id].add_(grad_w2_cpu[i])
+            self._grad_weight1[expert_id].copy_(grad_w1_pinned[i])
+            self._grad_weight2[expert_id].copy_(grad_w2_pinned[i])
+            
+        # 此时，计算图中的 grad_w1 和 grad_w2 的显存会在函数返回后被 PyTorch 自动回收
+            
 
     def sync_gradients(self):
         """Synchronize accumulated gradients to parameters.
