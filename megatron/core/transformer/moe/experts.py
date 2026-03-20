@@ -1130,9 +1130,38 @@ class ActivationCache:
         self._cpu_buffer: Optional[torch.Tensor] = None
         self._shape: Optional[Tuple[int, ...]] = None
         self._dtype: Optional[torch.dtype] = None
+        # CUDA stream for async D2H transfer (offload to CPU)
+        self._offload_stream: Optional[torch.cuda.Stream] = None
+
+    def offload_to_cpu_async(self, tensor: torch.Tensor) -> None:
+        """Async copy tensor to pinned CPU memory using dedicated stream.
+
+        This overlaps D2H transfer with GPU compute operations.
+
+        Args:
+            tensor: The GPU tensor to offload to CPU.
+        """
+        if not self.enabled:
+            return
+        if self._offload_stream is None:
+            self._offload_stream = torch.cuda.Stream()
+        if self._cpu_buffer is None or self._cpu_buffer.shape != tensor.shape:
+            self._cpu_buffer = torch.empty_like(
+                tensor.detach(), device='cpu', pin_memory=True
+            )
+        with torch.cuda.stream(self._offload_stream):
+            self._cpu_buffer.copy_(tensor.detach(), non_blocking=True)
+        self._shape = tensor.shape
+        self._dtype = tensor.dtype
+
+    def wait_offload(self) -> None:
+        """Wait for async offload to complete."""
+        if not self.enabled or self._offload_stream is None:
+            return
+        torch.cuda.current_stream().wait_stream(self._offload_stream)
 
     def offload_to_cpu(self, tensor: torch.Tensor) -> None:
-        """Copy tensor to pinned CPU memory.
+        """Copy tensor to pinned CPU memory (synchronous version for compatibility).
 
         Args:
             tensor: The GPU tensor to offload to CPU.
@@ -1465,6 +1494,145 @@ class SequentialMLP(MegatronModule):
             sharded_state_dict.update(expert_state_dict)
         return sharded_state_dict
 
+class _GlobalBufferManager:
+    """Global Buffer Manager for CacheGroupedMLP - all layers share the same buffers.
+
+    Since Transformer layers are executed sequentially, there's no need for each layer
+    to have its own set of pinned buffers and GPU workspaces. This singleton manager
+    provides shared buffers that all CacheGroupedMLP instances can reuse.
+    """
+
+    _instance = None
+    _initialized = False
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def is_initialized(self) -> bool:
+        """Check if buffers have been initialized."""
+        return self._initialized
+
+    def initialize(
+        self,
+        num_global_experts: int,
+        hidden_size: int,
+        fc1_out_features: int,
+        ffn_hidden_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        """Initialize global shared buffers. Only creates new buffers if not already initialized."""
+        if self._initialized:
+            return
+
+        # Pinned buffers for H2D transfer (CPU -> GPU async transfer)
+        self._w1_h2d_pinned = torch.empty(
+            num_global_experts, hidden_size, fc1_out_features,
+            dtype=dtype, device='cpu', pin_memory=True
+        )
+        self._w2_h2d_pinned = torch.empty(
+            num_global_experts, ffn_hidden_size, hidden_size,
+            dtype=dtype, device='cpu', pin_memory=True
+        )
+
+        # GPU workspace (double-buffered for async prefetch)
+        # Shape: [2 buffers, max_experts_per_set (8), ...]
+        self._w1_gpu_workspace = torch.empty(
+            2, 8, hidden_size, fc1_out_features,
+            dtype=dtype, device=device
+        )
+        self._w2_gpu_workspace = torch.empty(
+            2, 8, ffn_hidden_size, hidden_size,
+            dtype=dtype, device=device
+        )
+
+        # Pinned buffers for gradient offload (D2H transfer)
+        self._grad_w1_pinned = torch.empty(
+            num_global_experts, hidden_size, fc1_out_features,
+            dtype=dtype, device='cpu', pin_memory=True
+        )
+        self._grad_w2_pinned = torch.empty(
+            num_global_experts, ffn_hidden_size, hidden_size,
+            dtype=dtype, device='cpu', pin_memory=True
+        )
+
+        # CUDA streams (shared across layers)
+        self._load_stream = torch.cuda.Stream()
+        self._grad_offload_stream = torch.cuda.Stream()
+
+        self._initialized = True
+
+    def cleanup(self):
+        """Release all resources. Should be called after all layers are done."""
+        if not self._initialized:
+            return
+
+        # Synchronize and clean up CUDA streams
+        if self._load_stream is not None:
+            self._load_stream.synchronize()
+            self._load_stream = None
+        if self._grad_offload_stream is not None:
+            self._grad_offload_stream.synchronize()
+            self._grad_offload_stream = None
+
+        # Release buffers (set to None for garbage collection)
+        self._w1_h2d_pinned = None
+        self._w2_h2d_pinned = None
+        self._w1_gpu_workspace = None
+        self._w2_gpu_workspace = None
+        self._grad_w1_pinned = None
+        self._grad_w2_pinned = None
+
+        self._initialized = False
+
+    @property
+    def w1_h2d_pinned(self):
+        return self._w1_h2d_pinned
+
+    @property
+    def w2_h2d_pinned(self):
+        return self._w2_h2d_pinned
+
+    @property
+    def w1_gpu_workspace(self):
+        return self._w1_gpu_workspace
+
+    @property
+    def w2_gpu_workspace(self):
+        return self._w2_gpu_workspace
+
+    @property
+    def grad_w1_pinned(self):
+        return self._grad_w1_pinned
+
+    @property
+    def grad_w2_pinned(self):
+        return self._grad_w2_pinned
+
+    @property
+    def load_stream(self):
+        return self._load_stream
+
+    @property
+    def grad_offload_stream(self):
+        return self._grad_offload_stream
+
+
+# Global singleton instance
+_global_buffer_manager = _GlobalBufferManager()
+
+
+def cleanup_global_buffers():
+    """Clean up global shared buffers.
+
+    This should be called after all CacheGroupedMLP layers have finished
+    their work (e.g., at the end of training or inference).
+    """
+    _global_buffer_manager.cleanup()
+
+
 class CacheGroupedMLP(MegatronModule):
     """An implementation of the Experts layer using GroupedGEMM with expert weight caching.
 
@@ -1644,27 +1812,27 @@ class CacheGroupedMLP(MegatronModule):
             and cache_enabled
         )
         self.activation_cache = ActivationCache(enabled=self.activation_offload)
-        
-        # pin mem buffer for forward expert load
-        self._w1_h2d_pinned_buffer = torch.empty(
-            num_global_experts, hidden_size, fc1_out_features,
-            dtype=config.params_dtype, device='cpu', pin_memory=True
-        )
-        self._w2_h2d_pinned_buffer = torch.empty(
-            num_global_experts, ffn_hidden_size, hidden_size,
-            dtype=config.params_dtype, device='cpu', pin_memory=True
-        )
-        
-        # GPU mem buffer for forward expert load
+
+        # Initialize and use global shared buffers (shared across all layers)
         device = torch.cuda.current_device()
-        self._w1_gpu_workspace = torch.empty(
-            8, hidden_size, fc1_out_features,
-            dtype=config.params_dtype, device=device
+        _global_buffer_manager.initialize(
+            num_global_experts=num_global_experts,
+            hidden_size=hidden_size,
+            fc1_out_features=fc1_out_features,
+            ffn_hidden_size=ffn_hidden_size,
+            dtype=config.params_dtype,
+            device=device,
         )
-        self._w2_gpu_workspace = torch.empty(
-            8, ffn_hidden_size, hidden_size,
-            dtype=config.params_dtype, device=device
-        )
+
+        # Reference global buffers (no new allocation - just get references)
+        self._w1_h2d_pinned_buffer = _global_buffer_manager.w1_h2d_pinned
+        self._w2_h2d_pinned_buffer = _global_buffer_manager.w2_h2d_pinned
+        self._w1_gpu_workspace = _global_buffer_manager.w1_gpu_workspace
+        self._w2_gpu_workspace = _global_buffer_manager.w2_gpu_workspace
+        self._grad_w1_pinned_buffer = _global_buffer_manager.grad_w1_pinned
+        self._grad_w2_pinned_buffer = _global_buffer_manager.grad_w2_pinned
+        self._load_stream = _global_buffer_manager.load_stream
+        self._grad_offload_stream = _global_buffer_manager.grad_offload_stream
         
     def _load_expert_weights(self, expert_ids: List[int], device: torch.device):
         num_experts = len(expert_ids)
@@ -1694,32 +1862,71 @@ class CacheGroupedMLP(MegatronModule):
 
         return w1_gpu, w2_gpu
 
+    def _prefetch_expert_weights_async(
+        self,
+        expert_ids: List[int],
+        buffer_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Async prefetch expert weights to GPU buffer with double buffering.
+
+        Uses a dedicated CUDA stream for async loading to overlap with compute.
+
+        Args:
+            expert_ids: List of expert IDs to load
+            buffer_idx: Buffer index (0 or 1) for double buffering
+
+        Returns:
+            Tuple of (w1_gpu, w2_gpu) - views into GPU workspace
+        """
+        num_experts = len(expert_ids)
+
+        # 1. CPU -> CPU (pinned memory) - on main thread
+        for i, exp_id in enumerate(expert_ids):
+            self._w1_h2d_pinned_buffer[i].copy_(self.weight1.data[exp_id])
+            self._w2_h2d_pinned_buffer[i].copy_(self.weight2.data[exp_id])
+
+        w1_pinned_view = self._w1_h2d_pinned_buffer[:num_experts]
+        w2_pinned_view = self._w2_h2d_pinned_buffer[:num_experts]
+
+        # 2. Async transfer to GPU (on load_stream)
+        w1_gpu = self._w1_gpu_workspace[buffer_idx, :num_experts]
+        w2_gpu = self._w2_gpu_workspace[buffer_idx, :num_experts]
+
+        with torch.cuda.stream(self._load_stream):
+            w1_gpu.copy_(w1_pinned_view, non_blocking=True)
+            w2_gpu.copy_(w2_pinned_view, non_blocking=True)
+
+        return w1_gpu, w2_gpu
+
     def _offload_grads_to_cpu(
         self,
         expert_ids: List[int],
         grad_w1: torch.Tensor,
         grad_w2: torch.Tensor,
     ):
-        """Offload gradients to CPU efficiently using a Pinned Memory staging buffer."""
-        
-        grad_w1_pinned = torch.empty_like(grad_w1, device='cpu', pin_memory=True)
-        grad_w2_pinned = torch.empty_like(grad_w2, device='cpu', pin_memory=True)
+        """Offload gradients to CPU efficiently using pre-allocated Pinned Memory buffer.
 
-        # 2. 异步、整块地将 GPU 梯度拉回到 Pinned Memory
-        # non_blocking=True 只有在目标是 Pinned Memory 时才会真正生效！
-        grad_w1_pinned.copy_(grad_w1, non_blocking=True)
-        grad_w2_pinned.copy_(grad_w2, non_blocking=True)
+        Uses a dedicated CUDA stream for async D2H transfer, allowing overlap with
+        next expert set's weight prefetch.
+        """
+        num_experts = len(expert_ids)
 
-        # 3. 等待这段异步拷贝完成，释放 GPU 去做其他算子的反向传播
-        torch.cuda.current_stream().synchronize()
+        # Use pre-allocated pinned buffers
+        grad_w1_pinned = self._grad_w1_pinned_buffer[:num_experts]
+        grad_w2_pinned = self._grad_w2_pinned_buffer[:num_experts]
 
-        # 4. 在纯 CPU 侧，将数据从 Pinned Buffer 赋值 (copy_) 到 Shared Memory
-        # 因为在你的设计中每个专家只计算一次，所以直接覆盖即可
+        # Async D2H on dedicated stream (can overlap with weight prefetch)
+        with torch.cuda.stream(self._grad_offload_stream):
+            grad_w1_pinned.copy_(grad_w1, non_blocking=True)
+            grad_w2_pinned.copy_(grad_w2, non_blocking=True)
+
+        # Wait for D2H to complete before CPU reads
+        torch.cuda.current_stream().wait_stream(self._grad_offload_stream)
+
+        # CPU -> CPU copy from pinned buffer to shared memory
         for i, expert_id in enumerate(expert_ids):
             self._grad_weight1[expert_id].copy_(grad_w1_pinned[i])
             self._grad_weight2[expert_id].copy_(grad_w2_pinned[i])
-            
-        # 此时，计算图中的 grad_w1 和 grad_w2 的显存会在函数返回后被 PyTorch 自动回收
             
 
     def sync_gradients(self):
@@ -1745,29 +1952,53 @@ class CacheGroupedMLP(MegatronModule):
             self._grad_weight2.zero_()
 
     def release(self):
-        """Release shared memory resources."""
+        """Release shared memory resources with proper synchronization.
+
+        This method ensures:
+        1. All CUDA streams are synchronized before cleanup
+        2. All ranks close shared memory before any rank unlinks it
+        3. Resources are properly cleaned up to avoid zombies and timeouts
+        """
         is_rank_0 = self.ep_group is None or self.ep_rank == 0
 
+        # 1. Synchronize CUDA streams (ensure all GPU operations complete)
+        # This prevents CUDA context destruction from forcing long syncs
+        if self._load_stream is not None:
+            self._load_stream.synchronize()
+        if self._grad_offload_stream is not None:
+            self._grad_offload_stream.synchronize()
+
+        # 2. Close shared memory (all ranks must do this)
         if self._shm_w1 is not None:
             self._shm_w1.close()
-            if is_rank_0:
-                try:
-                    self._shm_w1.unlink()
-                except FileNotFoundError:
-                    pass
             self._shm_w1 = None
 
         if self._shm_w2 is not None:
             self._shm_w2.close()
-            if is_rank_0:
-                try:
-                    self._shm_w2.unlink()
-                except FileNotFoundError:
-                    pass
             self._shm_w2 = None
 
+        # 3. Barrier to ensure all ranks have closed before unlink
+        # This prevents race conditions where rank 0 unlinks while others are still accessing
+        if self.ep_group is not None:
+            torch.distributed.barrier(group=self.ep_group)
+
+        # 4. Only rank 0 unlinks, after all ranks have closed
+        if is_rank_0:
+            try:
+                shm.SharedMemory(name=f"megatron_moe_w1_r{self.ep_rank}").unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                shm.SharedMemory(name=f"megatron_moe_w2_r{self.ep_rank}").unlink()
+            except FileNotFoundError:
+                pass
+
+        # 5. Clean up gradient buffer references
         self._grad_weight1 = None
         self._grad_weight2 = None
+
+        # Note: Don't clean up shared buffers here - they're managed by _global_buffer_manager
+        # and will be cleaned up via cleanup_global_buffers() when all layers are done.
 
     def forward(
         self,
@@ -1822,9 +2053,9 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
         ctx.expert_sets = expert_sets
         ctx.num_sets = len(expert_sets)
 
-        # Offload activation to CPU if enabled
+        # Offload activation to CPU asynchronously (overlaps with weight loading and compute)
         if self.activation_offload:
-            self.activation_cache.offload_to_cpu(hidden_states)
+            self.activation_cache.offload_to_cpu_async(hidden_states)
             ctx.save_for_backward(*tokens_per_expert_per_set, *probs_per_set)
             ctx.activation_offloaded = True
         else:
@@ -1837,6 +2068,15 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
 
         nvtx.range_push("CacheGroupedMLP::forward")
 
+        # Double buffering for async prefetch
+        current_buffer = 0
+        next_buffer = 1
+        num_sets = len(expert_sets)
+
+        # Prefetch first set
+        if num_sets > 0 and len(expert_sets[0]) > 0:
+            self._prefetch_expert_weights_async(expert_sets[0], current_buffer)
+
         for set_idx, expert_ids in enumerate(expert_sets):
             tokens_per_expert = tokens_per_expert_per_set[set_idx]
             probs = probs_per_set[set_idx]
@@ -1845,17 +2085,21 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             if num_tokens == 0:
                 continue
 
-            # Extract current set's hidden states
+            # 1. Wait for current set's weight loading to complete
+            torch.cuda.current_stream().wait_stream(self._load_stream)
+
+            # 2. Get weights from current buffer
+            w1_gpu = self._w1_gpu_workspace[current_buffer, :len(expert_ids)]
+            w2_gpu = self._w2_gpu_workspace[current_buffer, :len(expert_ids)]
+
+            # 3. Start prefetching next set (if exists)
+            next_set_idx = set_idx + 1
+            if next_set_idx < num_sets and len(expert_sets[next_set_idx]) > 0:
+                self._prefetch_expert_weights_async(expert_sets[next_set_idx], next_buffer)
+
+            # 4. Execute current set's compute (on default stream)
             set_hidden_states = hidden_states[token_offset:token_offset + num_tokens]
-            token_offset += num_tokens
-
-            # Load weights for this set
-            w1_gpu, w2_gpu = self._load_expert_weights(expert_ids, device)
-
-            # Ensure tokens_per_expert is on CPU for GroupedGEMM
             tokens_per_expert_cpu = tokens_per_expert.cpu()
-
-            # Move probs to GPU
             probs_gpu = probs.to(device, non_blocking=True)
 
             # GroupedGEMM: fc1
@@ -1872,6 +2116,10 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             )
 
             output_list.append(fc2_output)
+            token_offset += num_tokens
+
+            # 5. Swap buffers
+            current_buffer, next_buffer = next_buffer, current_buffer
 
         nvtx.range_pop()
 
@@ -1897,6 +2145,8 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
 
         # Load activation from CPU if offloaded, otherwise use saved tensor
         if ctx.activation_offloaded:
+            # Wait for async offload to complete before loading back
+            self.activation_cache.wait_offload()
             saved_tensors = ctx.saved_tensors
             tokens_per_expert_per_set = list(saved_tensors[:num_sets])
             probs_per_set = list(saved_tensors[num_sets:2*num_sets])
@@ -1916,6 +2166,14 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
 
         nvtx.range_push("CacheGroupedMLP::backward")
 
+        # Double buffering for async prefetch
+        current_buffer = 0
+        next_buffer = 1
+
+        # Prefetch first set
+        if num_sets > 0 and len(expert_sets[0]) > 0:
+            self._prefetch_expert_weights_async(expert_sets[0], current_buffer)
+
         for set_idx, expert_ids in enumerate(expert_sets):
             tokens_per_expert = tokens_per_expert_per_set[set_idx]
             probs = probs_per_set[set_idx]
@@ -1924,19 +2182,22 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             if num_tokens == 0:
                 continue
 
-            # Extract current set's data
+            # 1. Wait for weight loading to complete
+            torch.cuda.current_stream().wait_stream(self._load_stream)
+
+            # 2. Get weights from current buffer
+            w1_gpu = self._w1_gpu_workspace[current_buffer, :len(expert_ids)]
+            w2_gpu = self._w2_gpu_workspace[current_buffer, :len(expert_ids)]
+
+            # 3. Start prefetching next set (if exists)
+            next_set_idx = set_idx + 1
+            if next_set_idx < num_sets and len(expert_sets[next_set_idx]) > 0:
+                self._prefetch_expert_weights_async(expert_sets[next_set_idx], next_buffer)
+
+            # 4. Execute current set's compute
             set_hidden_states = hidden_states[token_offset:token_offset + num_tokens]
             set_grad_output = grad_output[grad_offset:grad_offset + num_tokens]
-            token_offset += num_tokens
-            grad_offset += num_tokens
-
-            # Load weights for this set
-            w1_gpu, w2_gpu = self._load_expert_weights(expert_ids, device)
-
-            # Recompute forward with gradients
             tokens_per_expert_cpu = tokens_per_expert.cpu()
-
-            # Move probs to GPU
             probs_gpu = probs.to(device, non_blocking=True)
 
             with torch.enable_grad():
@@ -1972,6 +2233,11 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             self._offload_grads_to_cpu(expert_ids, grad_w1, grad_w2)
 
             grad_input_list.append(grad_input)
+            token_offset += num_tokens
+            grad_offset += num_tokens
+
+            # 5. Swap buffers
+            current_buffer, next_buffer = next_buffer, current_buffer
 
         nvtx.range_pop()
 
