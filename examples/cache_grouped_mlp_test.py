@@ -5,9 +5,20 @@ This script directly tests CacheGroupedMLP in a distributed EP setting,
 simulating expert routing by generating random expert_sets and token distributions.
 
 Usage:
+    # Single-layer test (default)
     CUDA_VISIBLE_DEVICES=0 ./examples/cache_grouped_mlp_test.sh
+
+    # Multi-layer test with custom batch_size and seq_len
+    CUDA_VISIBLE_DEVICES=0 ./examples/cache_grouped_mlp_test.sh --num-layers 4 --batch-size 2 --seq-len 4096
+
+    # Multi-GPU test
     CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 ./examples/cache_grouped_mlp_test.sh
+
+    # With activation offload
     CUDA_VISIBLE_DEVICES=0 ACTIVATION_OFFLOAD=1 ./examples/cache_grouped_mlp_test.sh
+
+    # With custom data seed for reproducible input
+    CUDA_VISIBLE_DEVICES=0 ./examples/cache_grouped_mlp_test.sh --data-seed 42
 """
 
 import argparse
@@ -241,8 +252,16 @@ def main() -> int:
     parser.add_argument("--hidden-size", type=int, default=7168)
     parser.add_argument("--ffn-hidden-size", type=int, default=2048)
     parser.add_argument("--tokens-per-expert", type=int, default=256)
+    parser.add_argument("--num-layers", type=int, default=1,
+                        help="Number of MoE layers to simulate")
+    parser.add_argument("--batch-size", type=int, default=1,
+                        help="Number of sequences in a batch")
+    parser.add_argument("--seq-len", type=int, default=4096,
+                        help="Sequence length (tokens per sequence)")
     parser.add_argument("--bf16", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--data-seed", type=int, default=None,
+                        help="Random seed for data initialization (default: same as --seed)")
     parser.add_argument("--trace-offload", action="store_true")
     parser.add_argument("--activation-offload", action="store_true",
                         help="Enable MoE input activation offload to CPU")
@@ -269,7 +288,7 @@ def main() -> int:
 
     # Create config
     config = TransformerConfig(
-        num_layers=2,
+        num_layers=args.num_layers,
         hidden_size=args.hidden_size,
         num_attention_heads=128,
         ffn_hidden_size=args.ffn_hidden_size,
@@ -290,24 +309,34 @@ def main() -> int:
     ep_rank = dist.get_rank(ep_group)
     pg_collection = ProcessGroupCollection(ep=ep_group)
 
-    # Create model
-    model = CacheGroupedMLP(
-        num_global_experts=args.num_global_experts,
-        config=config,
-        pg_collection=pg_collection,
-    )
+    # Create models for each layer
+    models = [
+        CacheGroupedMLP(
+            num_global_experts=args.num_global_experts,
+            config=config,
+            pg_collection=pg_collection,
+        )
+        for _ in range(args.num_layers)
+    ]
 
     if bf16:
-        model = model.bfloat16()
+        models = [m.bfloat16() for m in models]
 
-    model.train()
+    for m in models:
+        m.train()
 
-    # Setup tracing
+    # Setup tracing (only for first model if tracing)
     events: List[str] = []
     if args.trace_offload:
-        events = _wrap_cache_calls(model, rank=rank)
+        events = _wrap_cache_calls(models[0], rank=rank)
 
     device = torch.device("cuda")
+
+    # Calculate total tokens from batch_size and seq_len
+    total_tokens = args.batch_size * args.seq_len
+
+    # Set data seed (use model seed if not specified)
+    data_seed = args.data_seed if args.data_seed is not None else args.seed
 
     try:
         dist.barrier()
@@ -319,6 +348,7 @@ def main() -> int:
         if rank == 0:
             print(
                 f"CacheGroupedMLP Test: iters={args.iters} world={world_size} "
+                f"num_layers={args.num_layers} batch_size={args.batch_size} seq_len={args.seq_len} "
                 f"experts={args.num_global_experts} num_sets={args.num_sets} "
                 f"hidden_size={args.hidden_size} ffn_hidden_size={args.ffn_hidden_size} "
                 f"dtype={'bf16' if bf16 else 'fp32'} "
@@ -333,17 +363,21 @@ def main() -> int:
         total_backward_time = 0.0
 
         for it in range(args.iters):
-            model.zero_grad(set_to_none=True)
+            for m in models:
+                m.zero_grad(set_to_none=True)
 
             # Generate test data with external scheduling
             # Each rank only processes experts where expert_id % ep_size == ep_rank
+            # Use fixed data_seed for reproducible data generation (same data each iteration)
+            torch.manual_seed(data_seed)
+            avg_tokens_per_expert = total_tokens // len(my_experts) if my_experts else 0
             expert_sets, tokens_per_expert_per_set, probs_per_set, hidden_states = (
                 generate_expert_sets_for_rank(
                     num_global_experts=args.num_global_experts,
                     ep_rank=ep_rank,
                     ep_size=ep_size,
                     num_sets=args.num_sets,
-                    avg_tokens_per_expert=args.tokens_per_expert,
+                    avg_tokens_per_expert=avg_tokens_per_expert,
                     hidden_size=args.hidden_size,
                     dtype=params_dtype,
                     device=device,
@@ -356,38 +390,42 @@ def main() -> int:
                     print(f"iter {it}: no experts for rank {ep_rank}, skipping", flush=True)
                 continue
 
-            # Enable gradient computation
-            hidden_states.requires_grad_(True)
-
-            # Forward
+            # Forward through all layers
             t0 = time.time()
-            output, _ = model(
-                hidden_states=hidden_states,
-                tokens_per_expert_per_set=tokens_per_expert_per_set,
-                probs_per_set=probs_per_set,
-                expert_sets=expert_sets,
-            )
+            hidden_states.requires_grad_(True)
+            intermediate = hidden_states
+
+            for model in models:
+                output, _ = model(
+                    hidden_states=intermediate,
+                    tokens_per_expert_per_set=tokens_per_expert_per_set,
+                    probs_per_set=probs_per_set,
+                    expert_sets=expert_sets,
+                )
+                intermediate = output  # Pass to next layer
+
             torch.cuda.synchronize()
             forward_time = time.time() - t0
             total_forward_time += forward_time
 
-            # Backward
+            # Backward through all layers
             t0 = time.time()
-            loss = output.sum()
+            loss = intermediate.sum()
             loss.backward()
             torch.cuda.synchronize()
             backward_time = time.time() - t0
             total_backward_time += backward_time
 
-            # Sync gradients from CPU to parameters
-            model.sync_gradients()
+            # Sync gradients for all layers
+            for m in models:
+                m.sync_gradients()
 
-            # Verify weights on CPU
-            _assert_weights_on_cpu(model)
+            # Verify weights on CPU for first model
+            _assert_weights_on_cpu(models[0])
 
-            # Verify gradients for this rank's experts
-            assert model.weight1.grad is not None, "weight1.grad should be set after sync"
-            assert model.weight2.grad is not None, "weight2.grad should be set after sync"
+            # Verify gradients for this rank's experts (first model)
+            assert models[0].weight1.grad is not None, "weight1.grad should be set after sync"
+            assert models[0].weight2.grad is not None, "weight2.grad should be set after sync"
 
             # Get token statistics
             total_tokens = sum(t.sum().item() for t in tokens_per_expert_per_set)
@@ -407,6 +445,11 @@ def main() -> int:
         if rank == 0:
             print("\n" + "=" * 60)
             print("Summary:")
+            print(f"  Num layers: {args.num_layers}")
+            print(f"  Batch size: {args.batch_size}")
+            print(f"  Seq length: {args.seq_len}")
+            print(f"  Total tokens: {total_tokens}")
+            print(f"  Data seed: {data_seed}")
             print(f"  Avg forward time: {total_forward_time / args.iters:.3f}s")
             print(f"  Avg backward time: {total_backward_time / args.iters:.3f}s")
             print(f"  Total time: {total_forward_time + total_backward_time:.3f}s")
