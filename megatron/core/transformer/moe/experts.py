@@ -1585,9 +1585,23 @@ class CacheGroupedMLP(MegatronModule):
             # Initialize weights only on rank 0
             if config.perform_initialization and is_rank_0:
                 with torch.no_grad():
+                    # 获取当前进程的 GPU
+                    device = torch.cuda.current_device()
+                    
                     for i in range(num_global_experts):
-                        config.init_method(weight1_data[i])
-                        config.output_layer_init_method(weight2_data[i])
+                        # 1. 在 GPU 上临时建一个空的 Tensor
+                        temp_w1_gpu = torch.empty_like(weight1_data[i], device=device)
+                        temp_w2_gpu = torch.empty_like(weight2_data[i], device=device)
+                        
+                        # 2. 让 GPU 去做极其耗时的随机数初始化 (瞬间完成)
+                        config.init_method(temp_w1_gpu)
+                        config.output_layer_init_method(temp_w2_gpu)
+                        
+                        # 3. 把初始化好的结果快速拷回 CPU 的 Shared Memory
+                        weight1_data[i].copy_(temp_w1_gpu)
+                        weight2_data[i].copy_(temp_w2_gpu)
+                        
+                        # GPU 临时显存会在循环进入下一次时自动释放
 
             # Wait for rank 0 to finish initialization
             torch.distributed.barrier(group=self.ep_group)
@@ -1604,9 +1618,16 @@ class CacheGroupedMLP(MegatronModule):
 
             if config.perform_initialization:
                 with torch.no_grad():
+                    device = torch.cuda.current_device()
                     for i in range(num_global_experts):
-                        config.init_method(weight1_data[i])
-                        config.output_layer_init_method(weight2_data[i])
+                        temp_w1_gpu = torch.empty_like(weight1_data[i], device=device)
+                        temp_w2_gpu = torch.empty_like(weight2_data[i], device=device)
+                        
+                        config.init_method(temp_w1_gpu)
+                        config.output_layer_init_method(temp_w2_gpu)
+
+                        weight1_data[i].copy_(temp_w1_gpu)
+                        weight2_data[i].copy_(temp_w2_gpu)
 
         # Create Parameter (data is in shared memory or pinned memory)
         self.weight1 = Parameter(weight1_data)
