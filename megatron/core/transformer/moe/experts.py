@@ -2,6 +2,7 @@
 
 import contextlib
 import copy
+import ctypes
 import logging
 import multiprocessing.shared_memory as shm
 from dataclasses import dataclass
@@ -64,6 +65,72 @@ except ImportError:
     HAVE_TE = False
 
 logger = logging.getLogger(__name__)
+
+
+# CUDA Host Register utilities for pinning existing CPU tensors (e.g., shared memory)
+try:
+    _cudart = ctypes.CDLL('libcudart.so')
+except OSError:
+    try:
+        _cudart = ctypes.CDLL('libcudart.so.12')
+    except OSError:
+        _cudart = None
+
+_CUDA_SUCCESS = 0
+_CUDA_HOST_REGISTER_DEFAULT = 0x00
+
+
+def pin_existing_tensor(tensor: torch.Tensor) -> bool:
+    """Pin an existing CPU tensor in-place using cudaHostRegister.
+
+    This allows shared memory tensors (created via torch.frombuffer) to be
+    used directly for async DMA transfers to GPU, eliminating the need for
+    an intermediate copy to pinned memory.
+
+    Args:
+        tensor: A CPU tensor to pin in-place
+
+    Returns:
+        True if successfully pinned or already pinned
+
+    Raises:
+        RuntimeError: If cudaHostRegister fails
+    """
+    if tensor.device.type != 'cpu':
+        return True
+    if tensor.is_pinned():
+        return True
+    if _cudart is None:
+        raise RuntimeError("CUDA runtime library not found")
+
+    ptr = tensor.data_ptr()
+    size = tensor.element_size() * tensor.nelement()
+
+    ret = _cudart.cudaHostRegister(
+        ctypes.c_void_p(ptr),
+        ctypes.c_size_t(size),
+        ctypes.c_uint(_CUDA_HOST_REGISTER_DEFAULT)
+    )
+
+    if ret != _CUDA_SUCCESS:
+        raise RuntimeError(f"cudaHostRegister failed with error code {ret}")
+
+    return True
+
+
+def unpin_existing_tensor(tensor: torch.Tensor) -> None:
+    """Unpin a tensor that was pinned with cudaHostRegister.
+
+    Args:
+        tensor: A CPU tensor to unpin
+    """
+    if tensor.device.type != 'cpu':
+        return
+    if _cudart is None:
+        return
+
+    ptr = tensor.data_ptr()
+    _cudart.cudaHostUnregister(ctypes.c_void_p(ptr))
 
 
 @dataclass
@@ -1537,20 +1604,10 @@ class _GlobalBufferManager:
         if max_experts_per_set is None:
             max_experts_per_set = num_global_experts
 
-        # Pinned buffers for H2D transfer (CPU -> GPU async transfer)
-        # Double-buffered to avoid implicit sync when next set writes while DMA is in progress
-        # Shape: [2 buffers, max_experts_per_set, ...]
-        self._w1_h2d_pinned = torch.empty(
-            2, max_experts_per_set, hidden_size, fc1_out_features,
-            dtype=dtype, device='cpu', pin_memory=True
-        )
-        self._w2_h2d_pinned = torch.empty(
-            2, max_experts_per_set, ffn_hidden_size, hidden_size,
-            dtype=dtype, device='cpu', pin_memory=True
-        )
-
         # GPU workspace (double-buffered for async prefetch)
         # Shape: [2 buffers, max_experts_per_set, ...]
+        # Note: H2D pinned buffers are no longer needed - shared memory is pinned
+        # directly via cudaHostRegister, allowing direct DMA transfer
         self._w1_gpu_workspace = torch.empty(
             2, max_experts_per_set, hidden_size, fc1_out_features,
             dtype=dtype, device=device
@@ -1560,15 +1617,8 @@ class _GlobalBufferManager:
             dtype=dtype, device=device
         )
 
-        # Pinned buffers for gradient offload (D2H transfer)
-        self._grad_w1_pinned = torch.empty(
-            num_global_experts, hidden_size, fc1_out_features,
-            dtype=dtype, device='cpu', pin_memory=True
-        )
-        self._grad_w2_pinned = torch.empty(
-            num_global_experts, ffn_hidden_size, hidden_size,
-            dtype=dtype, device='cpu', pin_memory=True
-        )
+        # Note: Gradient pinned buffers are no longer needed - gradient shared memory
+        # is pinned directly via cudaHostRegister
 
         # CUDA streams (shared across layers)
         self._load_stream = torch.cuda.Stream()
@@ -1590,22 +1640,10 @@ class _GlobalBufferManager:
             self._grad_offload_stream = None
 
         # Release buffers (set to None for garbage collection)
-        self._w1_h2d_pinned = None
-        self._w2_h2d_pinned = None
         self._w1_gpu_workspace = None
         self._w2_gpu_workspace = None
-        self._grad_w1_pinned = None
-        self._grad_w2_pinned = None
 
         self._initialized = False
-
-    @property
-    def w1_h2d_pinned(self):
-        return self._w1_h2d_pinned
-
-    @property
-    def w2_h2d_pinned(self):
-        return self._w2_h2d_pinned
 
     @property
     def w1_gpu_workspace(self):
@@ -1614,14 +1652,6 @@ class _GlobalBufferManager:
     @property
     def w2_gpu_workspace(self):
         return self._w2_gpu_workspace
-
-    @property
-    def grad_w1_pinned(self):
-        return self._grad_w1_pinned
-
-    @property
-    def grad_w2_pinned(self):
-        return self._grad_w2_pinned
 
     @property
     def load_stream(self):
@@ -1713,6 +1743,8 @@ class CacheGroupedMLP(MegatronModule):
         use_shm = self.ep_group is not None and self.ep_size > 1
         self._shm_w1: Optional[shm.SharedMemory] = None
         self._shm_w2: Optional[shm.SharedMemory] = None
+        self._shm_g1: Optional[shm.SharedMemory] = None
+        self._shm_g2: Optional[shm.SharedMemory] = None
 
         if use_shm:
             # Shared memory approach - rank 0 creates, others attach
@@ -1761,6 +1793,11 @@ class CacheGroupedMLP(MegatronModule):
             weight2_data = torch.frombuffer(
                 self._shm_w2.buf, dtype=config.params_dtype
             ).view(num_global_experts, ffn_hidden_size, hidden_size)
+
+            # Pin the shared memory tensors directly using cudaHostRegister
+            # This allows async DMA transfers without intermediate CPU copy
+            pin_existing_tensor(weight1_data)
+            pin_existing_tensor(weight2_data)
 
             # Initialize weights only on rank 0
             if config.perform_initialization and is_rank_0:
@@ -1813,9 +1850,58 @@ class CacheGroupedMLP(MegatronModule):
         self.weight1 = Parameter(weight1_data)
         self.weight2 = Parameter(weight2_data)
 
-        # Gradient buffers (shared memory for EP, pinned memory for single rank)
-        self._grad_weight1: Optional[torch.Tensor] = torch.zeros_like(weight1_data, pin_memory=True)
-        self._grad_weight2: Optional[torch.Tensor] = torch.zeros_like(weight2_data, pin_memory=True)
+        # Gradient buffers
+        # For shared memory case: create in shared memory and pin via cudaHostRegister
+        # For single rank case: use regular pinned memory
+        if use_shm:
+            # Gradient buffer shapes (same as weights)
+            size_g1 = num_global_experts * hidden_size * fc1_out_features * config.params_dtype.itemsize
+            size_g2 = num_global_experts * ffn_hidden_size * hidden_size * config.params_dtype.itemsize
+
+            # Create gradient shared memory
+            shm_name_g1 = f"megatron_moe_g1_r{base_rank}"
+            if is_rank_0:
+                try:
+                    shm.SharedMemory(name=shm_name_g1).unlink()
+                except FileNotFoundError:
+                    pass
+                self._shm_g1 = shm.SharedMemory(create=True, size=size_g1, name=shm_name_g1)
+
+            torch.distributed.barrier(group=self.ep_group)
+
+            if not is_rank_0:
+                self._shm_g1 = shm.SharedMemory(name=shm_name_g1)
+
+            self._grad_weight1 = torch.frombuffer(
+                self._shm_g1.buf, dtype=config.params_dtype
+            ).view(num_global_experts, hidden_size, fc1_out_features)
+            self._grad_weight1.zero_()
+
+            shm_name_g2 = f"megatron_moe_g2_r{base_rank}"
+            if is_rank_0:
+                try:
+                    shm.SharedMemory(name=shm_name_g2).unlink()
+                except FileNotFoundError:
+                    pass
+                self._shm_g2 = shm.SharedMemory(create=True, size=size_g2, name=shm_name_g2)
+
+            torch.distributed.barrier(group=self.ep_group)
+
+            if not is_rank_0:
+                self._shm_g2 = shm.SharedMemory(name=shm_name_g2)
+
+            self._grad_weight2 = torch.frombuffer(
+                self._shm_g2.buf, dtype=config.params_dtype
+            ).view(num_global_experts, ffn_hidden_size, hidden_size)
+            self._grad_weight2.zero_()
+
+            # Pin gradient shared memory tensors
+            pin_existing_tensor(self._grad_weight1)
+            pin_existing_tensor(self._grad_weight2)
+        else:
+            # Single rank: use pinned memory for faster transfers
+            self._grad_weight1: Optional[torch.Tensor] = torch.zeros_like(weight1_data, pin_memory=True)
+            self._grad_weight2: Optional[torch.Tensor] = torch.zeros_like(weight2_data, pin_memory=True)
 
         # Setup activation offload
         cache_enabled = getattr(self.config, "moe_enable_expert_weight_cache", True)
@@ -1837,40 +1923,31 @@ class CacheGroupedMLP(MegatronModule):
         )
 
         # Reference global buffers (no new allocation - just get references)
-        self._w1_h2d_pinned_buffer = _global_buffer_manager.w1_h2d_pinned
-        self._w2_h2d_pinned_buffer = _global_buffer_manager.w2_h2d_pinned
+        # Note: H2D pinned buffers removed - shared memory is pinned directly
         self._w1_gpu_workspace = _global_buffer_manager.w1_gpu_workspace
         self._w2_gpu_workspace = _global_buffer_manager.w2_gpu_workspace
-        self._grad_w1_pinned_buffer = _global_buffer_manager.grad_w1_pinned
-        self._grad_w2_pinned_buffer = _global_buffer_manager.grad_w2_pinned
         self._load_stream = _global_buffer_manager.load_stream
         self._grad_offload_stream = _global_buffer_manager.grad_offload_stream
         
     def _load_expert_weights(self, expert_ids: List[int], device: torch.device):
+        """Load expert weights to GPU synchronously.
+
+        With cudaHostRegister-pinned shared memory, transfers directly from
+        pinned SHM to GPU without intermediate CPU copy.
+        """
         num_experts = len(expert_ids)
-        
-        # 1. CPU -> CPU 聚合（Pageable to Pinned）
-        # 将共享内存中散落的专家权重，拷贝到连续的锁页内存中
-        # 这一步是 CPU 内部的拷贝，速度极快（受限于内存带宽），且不会阻塞 GPU
-        for i, exp_id in enumerate(expert_ids):
-            self._w1_h2d_pinned_buffer[i].copy_(self.weight1.data[exp_id])
-            self._w2_h2d_pinned_buffer[i].copy_(self.weight2.data[exp_id])
 
-        # 获取当前需要用到的连续内存视图 (View)，不产生实际拷贝
-        w1_pinned_view = self._w1_h2d_pinned_buffer[:num_experts]
-        w2_pinned_view = self._w2_h2d_pinned_buffer[:num_experts]
+        # Get views of the expert weights directly from pinned shared memory
+        w1_shm_view = self.weight1.data[expert_ids]
+        w2_shm_view = self.weight2.data[expert_ids]
 
-        # # 2. 在 GPU 上预分配空间
-        # # 注意：如果想极致优化，GPU 端也可以像 Pinned Buffer 一样做预分配和复用，避免每次 empty
-        # w1_gpu = torch.empty(num_experts, self.weight1.size(1), self.weight1.size(2), device=device, dtype=self.weight1.dtype)
-        # w2_gpu = torch.empty(num_experts, self.weight2.size(1), self.weight2.size(2), device=device, dtype=self.weight2.dtype)
-        w1_gpu = self._w1_gpu_workspace[:num_experts]
-        w2_gpu = self._w2_gpu_workspace[:num_experts]
+        # GPU workspace
+        w1_gpu = self._w1_gpu_workspace[0, :num_experts]
+        w2_gpu = self._w2_gpu_workspace[0, :num_experts]
 
-        # 3. CPU -> GPU 单次、大块、异步传输 (Pinned to VRAM)
-        # 因为源端是真正的锁页内存，这里非阻塞传输会完美生效，nsys 里只会看到一条宽阔的绿带
-        w1_gpu.copy_(w1_pinned_view, non_blocking=True)
-        w2_gpu.copy_(w2_pinned_view, non_blocking=True)
+        # Direct DMA transfer from pinned shared memory to GPU
+        w1_gpu.copy_(w1_shm_view, non_blocking=True)
+        w2_gpu.copy_(w2_shm_view, non_blocking=True)
 
         return w1_gpu, w2_gpu
 
@@ -1882,6 +1959,8 @@ class CacheGroupedMLP(MegatronModule):
         """Async prefetch expert weights to GPU buffer with double buffering.
 
         Uses a dedicated CUDA stream for async loading to overlap with compute.
+        With cudaHostRegister-pinned shared memory, transfers directly from
+        SHM to GPU without intermediate CPU copy.
 
         Args:
             expert_ids: List of expert IDs to load
@@ -1892,21 +1971,19 @@ class CacheGroupedMLP(MegatronModule):
         """
         num_experts = len(expert_ids)
 
-        # 1. CPU -> CPU (pinned memory) - use buffer_idx for double buffering
-        for i, exp_id in enumerate(expert_ids):
-            self._w1_h2d_pinned_buffer[buffer_idx, i].copy_(self.weight1.data[exp_id])
-            self._w2_h2d_pinned_buffer[buffer_idx, i].copy_(self.weight2.data[exp_id])
+        # Get views of the expert weights directly from pinned shared memory
+        # No CPU copy needed - direct indexing into pinned SHM tensors
+        w1_shm_view = self.weight1.data[expert_ids]
+        w2_shm_view = self.weight2.data[expert_ids]
 
-        w1_pinned_view = self._w1_h2d_pinned_buffer[buffer_idx, :num_experts]
-        w2_pinned_view = self._w2_h2d_pinned_buffer[buffer_idx, :num_experts]
-
-        # 2. Async transfer to GPU (on load_stream)
+        # GPU workspace for this buffer
         w1_gpu = self._w1_gpu_workspace[buffer_idx, :num_experts]
         w2_gpu = self._w2_gpu_workspace[buffer_idx, :num_experts]
 
+        # Direct DMA transfer from pinned shared memory to GPU
         with torch.cuda.stream(self._load_stream):
-            w1_gpu.copy_(w1_pinned_view, non_blocking=True)
-            w2_gpu.copy_(w2_pinned_view, non_blocking=True)
+            w1_gpu.copy_(w1_shm_view, non_blocking=True)
+            w2_gpu.copy_(w2_shm_view, non_blocking=True)
 
         return w1_gpu, w2_gpu
 
@@ -1916,29 +1993,27 @@ class CacheGroupedMLP(MegatronModule):
         grad_w1: torch.Tensor,
         grad_w2: torch.Tensor,
     ):
-        """Offload gradients to CPU efficiently using pre-allocated Pinned Memory buffer.
+        """Offload gradients to CPU efficiently using pinned gradient buffers.
+
+        With cudaHostRegister-pinned shared memory, transfers directly from
+        GPU to pinned SHM gradient buffers without intermediate CPU copy.
 
         Uses a dedicated CUDA stream for async D2H transfer, allowing overlap with
         next expert set's weight prefetch.
         """
         num_experts = len(expert_ids)
 
-        # Use pre-allocated pinned buffers
-        grad_w1_pinned = self._grad_w1_pinned_buffer[:num_experts]
-        grad_w2_pinned = self._grad_w2_pinned_buffer[:num_experts]
+        # Get views of gradient buffers directly from pinned shared memory
+        grad_w1_shm_view = self._grad_weight1[expert_ids]
+        grad_w2_shm_view = self._grad_weight2[expert_ids]
 
-        # Async D2H on dedicated stream (can overlap with weight prefetch)
+        # Direct D2H transfer to pinned shared memory
         with torch.cuda.stream(self._grad_offload_stream):
-            grad_w1_pinned.copy_(grad_w1, non_blocking=True)
-            grad_w2_pinned.copy_(grad_w2, non_blocking=True)
+            grad_w1_shm_view.copy_(grad_w1, non_blocking=True)
+            grad_w2_shm_view.copy_(grad_w2, non_blocking=True)
 
         # Wait for D2H to complete before CPU reads
         torch.cuda.current_stream().wait_stream(self._grad_offload_stream)
-
-        # CPU -> CPU copy from pinned buffer to shared memory
-        for i, expert_id in enumerate(expert_ids):
-            self._grad_weight1[expert_id].copy_(grad_w1_pinned[i])
-            self._grad_weight2[expert_id].copy_(grad_w2_pinned[i])
             
 
     def sync_gradients(self):
@@ -1968,8 +2043,9 @@ class CacheGroupedMLP(MegatronModule):
 
         This method ensures:
         1. All CUDA streams are synchronized before cleanup
-        2. All ranks close shared memory before any rank unlinks it
-        3. Resources are properly cleaned up to avoid zombies and timeouts
+        2. Pinned shared memory tensors are unpinned before closing
+        3. All ranks close shared memory before any rank unlinks it
+        4. Resources are properly cleaned up to avoid zombies and timeouts
         """
         is_rank_0 = self.ep_group is None or self.ep_rank == 0
 
@@ -1980,7 +2056,30 @@ class CacheGroupedMLP(MegatronModule):
         if self._grad_offload_stream is not None:
             self._grad_offload_stream.synchronize()
 
-        # 2. Close shared memory (all ranks must do this)
+        # 2. Unpin shared memory tensors (weights and gradients)
+        # Must be done before closing shared memory
+        if self.weight1 is not None and self.weight1.device.type == 'cpu':
+            try:
+                unpin_existing_tensor(self.weight1.data)
+            except Exception:
+                pass  # Ignore errors during cleanup
+        if self.weight2 is not None and self.weight2.device.type == 'cpu':
+            try:
+                unpin_existing_tensor(self.weight2.data)
+            except Exception:
+                pass
+        if self._grad_weight1 is not None and self._grad_weight1.device.type == 'cpu':
+            try:
+                unpin_existing_tensor(self._grad_weight1)
+            except Exception:
+                pass
+        if self._grad_weight2 is not None and self._grad_weight2.device.type == 'cpu':
+            try:
+                unpin_existing_tensor(self._grad_weight2)
+            except Exception:
+                pass
+
+        # 3. Close shared memory (all ranks must do this)
         if self._shm_w1 is not None:
             self._shm_w1.close()
             self._shm_w1 = None
@@ -1989,23 +2088,35 @@ class CacheGroupedMLP(MegatronModule):
             self._shm_w2.close()
             self._shm_w2 = None
 
-        # 3. Barrier to ensure all ranks have closed before unlink
+        if self._shm_g1 is not None:
+            self._shm_g1.close()
+            self._shm_g1 = None
+
+        if self._shm_g2 is not None:
+            self._shm_g2.close()
+            self._shm_g2 = None
+
+        # 4. Barrier to ensure all ranks have closed before unlink
         # This prevents race conditions where rank 0 unlinks while others are still accessing
         if self.ep_group is not None:
             torch.distributed.barrier(group=self.ep_group)
 
-        # 4. Only rank 0 unlinks, after all ranks have closed
+        # 5. Only rank 0 unlinks, after all ranks have closed
         if is_rank_0:
-            try:
-                shm.SharedMemory(name=f"megatron_moe_w1_r{self.ep_rank}").unlink()
-            except FileNotFoundError:
-                pass
-            try:
-                shm.SharedMemory(name=f"megatron_moe_w2_r{self.ep_rank}").unlink()
-            except FileNotFoundError:
-                pass
+            # Get base_rank for proper naming
+            if self.ep_group is not None:
+                ep_ranks = torch.distributed.get_process_group_ranks(self.ep_group)
+                base_rank = min(ep_ranks)
+            else:
+                base_rank = self.ep_rank
 
-        # 5. Clean up gradient buffer references
+            for suffix in ['w1', 'w2', 'g1', 'g2']:
+                try:
+                    shm.SharedMemory(name=f"megatron_moe_{suffix}_r{base_rank}").unlink()
+                except FileNotFoundError:
+                    pass
+
+        # 6. Clean up gradient buffer references
         self._grad_weight1 = None
         self._grad_weight2 = None
 
