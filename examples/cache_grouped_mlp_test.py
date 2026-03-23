@@ -1,31 +1,35 @@
 #!/usr/bin/env python
-"""Distributed test script for CacheGroupedMLP.
+"""Distributed test script for CacheGroupedMLP with full MoE pipeline.
 
-This script directly tests CacheGroupedMLP in a distributed EP setting,
-simulating expert routing by generating random expert_sets and token distributions.
+This script tests CacheGroupedMLP with real routing and dispatching,
+including:
+- Attention layers (via GPTModel)
+- TopKRouter for routing
+- MoEAlltoAllTokenDispatcher for token dispatching
+- CacheGroupedMLP for expert computation
 
 Usage:
-    # Single-layer test (default)
-    CUDA_VISIBLE_DEVICES=0 ./examples/cache_grouped_mlp_test.sh
+    # Single-GPU test
+    CUDA_VISIBLE_DEVICES=0 python examples/cache_grouped_mlp_test.py \\
+        --num-layers 1 --batch-size 2 --seq-len 4096
 
-    # Multi-layer test with custom batch_size and seq_len
-    CUDA_VISIBLE_DEVICES=0 ./examples/cache_grouped_mlp_test.sh --num-layers 4 --batch-size 2 --seq-len 4096
-
-    # Multi-GPU test
-    CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 ./examples/cache_grouped_mlp_test.sh
+    # Multi-GPU test (EP=2)
+    CUDA_VISIBLE_DEVICES=0,1 NPROC_PER_NODE=2 python examples/cache_grouped_mlp_test.py \\
+        --num-layers 1 --batch-size 2 --seq-len 4096
 
     # With activation offload
-    CUDA_VISIBLE_DEVICES=0 ACTIVATION_OFFLOAD=1 ./examples/cache_grouped_mlp_test.sh
+    CUDA_VISIBLE_DEVICES=0 python examples/cache_grouped_mlp_test.py \\
+        --activation-offload
 
-    # With custom data seed for reproducible input
-    CUDA_VISIBLE_DEVICES=0 ./examples/cache_grouped_mlp_test.sh --data-seed 42
+    # With trace offload for debugging
+    CUDA_VISIBLE_DEVICES=0 python examples/cache_grouped_mlp_test.py \\
+        --trace-offload
 """
 
 import argparse
 import os
-import random
 import time
-from typing import List, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -33,9 +37,23 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe.experts import CacheGroupedMLP
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.utils import get_te_version
+from megatron.training.utils import get_ltor_masks_and_position_ids
+
+# Import CacheGroupedMLP for direct testing
+try:
+    from megatron.core.transformer.moe.experts import CacheGroupedMLP
+    HAVE_CACHE_GROUPED_MLP = True
+except ImportError:
+    HAVE_CACHE_GROUPED_MLP = False
 
 
 def _init_distributed() -> Tuple[int, int, int]:
@@ -50,149 +68,128 @@ def _init_distributed() -> Tuple[int, int, int]:
     return rank, world_size, local_rank
 
 
-def _initialize_model_parallel(ep: int) -> None:
-    """Initialize model parallel groups with EP only."""
+def _initialize_model_parallel(tp: int, pp: int, ep: int) -> None:
+    """Initialize model parallel groups."""
     parallel_state.destroy_model_parallel()
     parallel_state.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
+        tensor_model_parallel_size=tp,
+        pipeline_model_parallel_size=pp,
         expert_model_parallel_size=ep,
     )
 
 
-def generate_expert_sets_for_rank(
-    num_global_experts: int,
-    ep_rank: int,
-    ep_size: int,
-    num_sets: int,
-    avg_tokens_per_expert: int,
-    hidden_size: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> Tuple[List[List[int]], List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
-    """Generate test data for CacheGroupedMLP with external scheduling.
-
-    This simulates external routing where each EP rank only processes experts
-    where expert_id % ep_size == ep_rank.
-
-    Args:
-        num_global_experts: Total number of global experts
-        ep_rank: Current EP rank
-        ep_size: Total EP world size
-        num_sets: Number of expert sets to generate
-        avg_tokens_per_expert: Average tokens per expert
-        hidden_size: Hidden dimension size
-        dtype: Data type for tensors
-        device: Device for tensors
-
-    Returns:
-        Tuple of (expert_sets, tokens_per_expert_per_set, probs_per_set, hidden_states)
-    """
-    # Determine which experts this rank is responsible for
-    my_experts = [e for e in range(num_global_experts) if e % ep_size == ep_rank]
-
-    if not my_experts:
-        # This rank has no experts to process
-        return [], [], [], torch.empty(0, hidden_size, dtype=dtype, device=device)
-
-    # Distribute experts across sets
-    experts_per_set = max(1, len(my_experts) // num_sets)
-    expert_sets = []
-    tokens_per_expert_per_set = []
-    probs_per_set = []
-    total_tokens = 0
-
-    for i in range(num_sets):
-        start = i * experts_per_set
-        end = min(start + experts_per_set, len(my_experts))
-        expert_set = my_experts[start:end]
-
-        if not expert_set:
-            continue
-
-        # Random number of tokens per expert
-        num_tokens_per_expert = [
-            random.randint(1, avg_tokens_per_expert * 2) for _ in expert_set
-        ]
-        tokens_per_expert = torch.tensor(num_tokens_per_expert, dtype=torch.long)
-
-        # Generate random probabilities
-        set_total_tokens = sum(num_tokens_per_expert)
-        probs = torch.rand(set_total_tokens, dtype=dtype)
-
-        expert_sets.append(expert_set)
-        tokens_per_expert_per_set.append(tokens_per_expert)
-        probs_per_set.append(probs)
-        total_tokens += set_total_tokens
-
-    # Generate hidden states
-    hidden_states = torch.randn(total_tokens, hidden_size, dtype=dtype, device=device)
-
-    return expert_sets, tokens_per_expert_per_set, probs_per_set, hidden_states
+def _iter_sequential_mlps(module: torch.nn.Module) -> Iterable[SequentialMLP]:
+    """Iterate over all SequentialMLP modules in a model."""
+    for m in module.modules():
+        if isinstance(m, SequentialMLP):
+            yield m
 
 
-def generate_expert_sets(
-    num_global_experts: int,
-    num_sets: int,
-    avg_tokens_per_expert: int,
-    hidden_size: int,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> Tuple[List[List[int]], List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
-    """Generate test data for CacheGroupedMLP.
-
-    This simulates the routing output from a router, generating:
-    - expert_sets: List of expert ID lists
-    - tokens_per_expert_per_set: Token counts per expert per set
-    - probs_per_set: Router probabilities per token per set
-    - hidden_states: Random hidden states for all tokens
-
-    Args:
-        num_global_experts: Total number of global experts
-        num_sets: Number of expert sets to generate
-        avg_tokens_per_expert: Average tokens per expert
-        hidden_size: Hidden dimension size
-        dtype: Data type for tensors
-        device: Device for tensors
-
-    Returns:
-        Tuple of (expert_sets, tokens_per_expert_per_set, probs_per_set, hidden_states)
-    """
-    experts_per_set = max(1, num_global_experts // num_sets)
-    expert_sets = []
-    tokens_per_expert_per_set = []
-    probs_per_set = []
-    total_tokens = 0
-
-    for i in range(num_sets):
-        # Determine expert range for this set
-        start_expert = i * experts_per_set
-        end_expert = min(start_expert + experts_per_set, num_global_experts)
-        expert_set = list(range(start_expert, end_expert))
-
-        # Random number of tokens per expert
-        num_tokens_per_expert = [
-            random.randint(1, avg_tokens_per_expert * 2) for _ in expert_set
-        ]
-        tokens_per_expert = torch.tensor(num_tokens_per_expert, dtype=torch.long)
-
-        # Generate random probabilities
-        set_total_tokens = sum(num_tokens_per_expert)
-        probs = torch.rand(set_total_tokens, dtype=dtype)
-
-        expert_sets.append(expert_set)
-        tokens_per_expert_per_set.append(tokens_per_expert)
-        probs_per_set.append(probs)
-        total_tokens += set_total_tokens
-
-    # Generate hidden states
-    hidden_states = torch.randn(total_tokens, hidden_size, dtype=dtype, device=device)
-
-    return expert_sets, tokens_per_expert_per_set, probs_per_set, hidden_states
-
-
-def _wrap_cache_calls(model: CacheGroupedMLP, rank: int) -> List[str]:
+def _wrap_cache_calls(model: torch.nn.Module, rank: int) -> List[str]:
     """Wrap weight cache operations for tracing."""
+    events: List[str] = []
+
+    for idx, mlp in enumerate(_iter_sequential_mlps(model)):
+        cache = mlp.weight_cache
+
+        orig_activate = cache.activate_group
+        orig_release = cache.release_group
+        orig_offload_grad = cache.offload_param_grad_to_cpu
+
+        def activate_group(
+            group_idx: int,
+            training: bool = True,
+            device: torch.device | None = None,
+            *,
+            _m=idx,
+            _orig_activate=orig_activate,
+        ):
+            events.append(f"rank{rank}:mlp{_m}:activate({group_idx})")
+            return _orig_activate(group_idx, training=training, device=device)
+
+        def release_group(
+            group_idx: int, copy_data: bool = True, *, _m=idx, _orig_release=orig_release
+        ):
+            out = _orig_release(group_idx, copy_data=copy_data)
+            events.append(f"rank{rank}:mlp{_m}:release({group_idx})")
+            return out
+
+        def offload_param_grad_to_cpu(
+            param: torch.nn.Parameter,
+            grad: torch.Tensor,
+            *,
+            _m=idx,
+            _orig_offload=orig_offload_grad,
+        ):
+            out = _orig_offload(param, grad)
+            pdev = str(param.device)
+            gdev = "None" if (param.grad is None) else str(param.grad.device)
+            events.append(f"rank{rank}:mlp{_m}:offload_grad(p={pdev},g={gdev})")
+            return out
+
+        cache.activate_group = activate_group  # type: ignore[method-assign]
+        cache.release_group = release_group  # type: ignore[method-assign]
+        cache.offload_param_grad_to_cpu = offload_param_grad_to_cpu  # type: ignore[method-assign]
+
+    return events
+
+
+def _assert_moe_params_on_cpu(model: torch.nn.Module) -> None:
+    """Verify that MoE expert parameters remain on CPU."""
+    for mlp in _iter_sequential_mlps(model):
+        for expert in mlp.local_experts:
+            for p in expert.parameters():
+                if str(p.device) != "cpu":
+                    raise AssertionError(f"expected expert param on cpu, got {p.device}")
+                if p.grad is not None and str(p.grad.device) != "cpu":
+                    raise AssertionError(f"expected expert grad on cpu, got {p.grad.device}")
+
+
+def _prime_expert_cache_to_cpu(model: torch.nn.Module) -> None:
+    """Prime expert cache by loading weights to CPU first."""
+    for mlp in _iter_sequential_mlps(model):
+        cache = mlp.weight_cache
+        if not cache.enabled:
+            continue
+        for expert_idx, expert in enumerate(mlp.local_experts):
+            first_param = next(expert.parameters(), None)
+            device = None if first_param is None else first_param.device
+            cache.activate_group(expert_idx, training=False, device=device)
+            cache.release_group(expert_idx, copy_data=False)
+
+
+def _move_non_moe_to_cuda(model: torch.nn.Module, device: torch.device) -> None:
+    """Move non-MoE parameters to CUDA device."""
+    expert_params = set()
+    expert_buffers = set()
+    for mlp in _iter_sequential_mlps(model):
+        for p in mlp.parameters():
+            expert_params.add(p)
+        for b in mlp.buffers():
+            expert_buffers.add(b)
+
+    for p in model.parameters():
+        if p in expert_params:
+            continue
+        p.data = p.data.to(device)
+
+    for b in model.buffers():
+        if b in expert_buffers:
+            continue
+        b.data = b.data.to(device)
+
+
+def _force_release_expert_cache(model: torch.nn.Module) -> None:
+    """Force release all expert cache."""
+    for mlp in _iter_sequential_mlps(model):
+        cache = mlp.weight_cache
+        if not cache.enabled:
+            continue
+        cache.release()
+
+
+def _wrap_cache_grouped_mlp_calls(model: 'CacheGroupedMLP', rank: int) -> List[str]:
+    """Wrap CacheGroupedMLP cache operations for tracing."""
     events: List[str] = []
 
     # Wrap weight loading
@@ -227,7 +224,7 @@ def _wrap_cache_calls(model: CacheGroupedMLP, rank: int) -> List[str]:
     return events
 
 
-def _assert_weights_on_cpu(model: CacheGroupedMLP) -> None:
+def _assert_weights_on_cpu(model: 'CacheGroupedMLP') -> None:
     """Verify that expert weights remain on CPU."""
     if model.weight1.device.type != "cpu":
         raise AssertionError(
@@ -239,43 +236,172 @@ def _assert_weights_on_cpu(model: CacheGroupedMLP) -> None:
         )
 
 
-def main() -> int:
-    os.environ.setdefault("NCCL_DEBUG", "ERROR")
-    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+def run_gpt_model_test(args: argparse.Namespace) -> int:
+    """Run test using GPTModel with SequentialMLP (reference implementation)."""
+    rank, world_size, _local_rank = _init_distributed()
 
-    parser = argparse.ArgumentParser(
-        description="Distributed test for CacheGroupedMLP"
+    tp_size = 1
+    pp_size = 1
+    ep_size = world_size
+    _initialize_model_parallel(tp=tp_size, pp=pp_size, ep=ep_size)
+
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    model_parallel_cuda_manual_seed(args.seed)
+
+    num_moe_experts = ep_size * args.num_local_experts
+
+    bf16 = bool(args.bf16 and torch.cuda.is_bf16_supported())
+    if args.use_flash_attn and not bf16:
+        raise RuntimeError("FlashAttention requires --bf16 in this script.")
+    if args.use_flash_attn:
+        head_dim = args.hidden_size // args.num_attention_heads
+        if args.hidden_size % args.num_attention_heads != 0:
+            raise RuntimeError("hidden_size must be divisible by num_attention_heads.")
+        if head_dim > 256:
+            raise RuntimeError(
+                f"FlashAttention requires head_dim <= 256, got {head_dim}. "
+                "Increase num_attention_heads or reduce hidden_size."
+            )
+
+    use_transformer_engine = args.use_transformer_engine or args.use_flash_attn
+    if use_transformer_engine and get_te_version() is None:
+        raise RuntimeError("Transformer Engine is required for FlashAttention backend.")
+    params_dtype = torch.bfloat16 if bf16 else torch.float32
+
+    config = TransformerConfig(
+        num_layers=args.num_layers,
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.num_attention_heads,
+        ffn_hidden_size=args.ffn_hidden_size,
+        moe_ffn_hidden_size=args.ffn_hidden_size,
+        num_moe_experts=num_moe_experts,
+        moe_layer_freq=1,
+        moe_router_topk=args.moe_router_topk,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type=args.moe_token_dispatcher_type,
+        moe_grouped_gemm=False,
+        moe_enable_expert_weight_cache=True,
+        moe_activation_offload=args.activation_offload,
+        use_cpu_initialization=True,
+        bf16=bf16,
+        params_dtype=params_dtype,
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        sequence_parallel=False,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        attention_backend=AttnBackend.flash if args.use_flash_attn else AttnBackend.auto,
     )
-    parser.add_argument("--iters", type=int, default=5)
-    parser.add_argument("--num-global-experts", type=int, default=64)
-    parser.add_argument("--num-sets", type=int, default=8)
-    parser.add_argument("--hidden-size", type=int, default=7168)
-    parser.add_argument("--ffn-hidden-size", type=int, default=2048)
-    parser.add_argument("--tokens-per-expert", type=int, default=256)
-    parser.add_argument("--num-layers", type=int, default=1,
-                        help="Number of MoE layers to simulate")
-    parser.add_argument("--batch-size", type=int, default=1,
-                        help="Number of sequences in a batch")
-    parser.add_argument("--seq-len", type=int, default=4096,
-                        help="Sequence length (tokens per sequence)")
-    parser.add_argument("--bf16", action="store_true")
-    parser.add_argument("--seed", type=int, default=1234)
-    parser.add_argument("--data-seed", type=int, default=None,
-                        help="Random seed for data initialization (default: same as --seed)")
-    parser.add_argument("--trace-offload", action="store_true")
-    parser.add_argument("--activation-offload", action="store_true",
-                        help="Enable MoE input activation offload to CPU")
-    args = parser.parse_args()
 
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for this script")
+    transformer_layer_spec = get_gpt_decoder_block_spec(
+        config, use_transformer_engine=use_transformer_engine
+    )
 
-    # Initialize distributed
+    model = GPTModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        vocab_size=args.vocab_size,
+        max_sequence_length=args.seq_len,
+    )
+
+    if bf16:
+        model = model.bfloat16()
+
+    _move_non_moe_to_cuda(model, torch.device("cuda"))
+    _force_release_expert_cache(model)
+
+    model.train()
+    _prime_expert_cache_to_cpu(model)
+
+    events: List[str] = []
+    if args.trace_offload:
+        events = _wrap_cache_calls(model, rank=rank)
+
+    device = torch.device("cuda")
+    eod_token = 0
+    pad_token = 0
+
+    try:
+        dist.barrier()
+        if rank == 0:
+            print(
+                f"GPTModel Test (SequentialMLP): iters={args.iters} world={world_size} "
+                f"experts={num_moe_experts} local_experts={args.num_local_experts} "
+                f"dtype={'bf16' if bf16 else 'fp32'} "
+                f"activation_offload={args.activation_offload}",
+                flush=True,
+            )
+
+        for it in range(args.iters):
+            model.zero_grad(set_to_none=True)
+
+            tokens = torch.randint(
+                low=0,
+                high=args.vocab_size,
+                size=(args.batch_size, args.seq_len),
+                device=device,
+                dtype=torch.long,
+            )
+            labels = torch.randint(
+                low=0,
+                high=args.vocab_size,
+                size=(args.batch_size, args.seq_len),
+                device=device,
+                dtype=torch.long,
+            )
+            attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+                tokens,
+                eod_token=eod_token,
+                pad_token=pad_token,
+                reset_position_ids=False,
+                reset_attention_mask=False,
+                eod_mask_loss=False,
+                pad_mask_loss=False,
+            )
+
+            t0 = time.time()
+            loss = model(
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+            )
+            loss = loss.float().mean()
+            loss.backward()
+            torch.cuda.synchronize()
+            dt = time.time() - t0
+
+            _force_release_expert_cache(model)
+            _assert_moe_params_on_cpu(model)
+
+            if rank == 0:
+                print(f"iter {it}: loss={loss.item():.6f} time={dt:.3f}s", flush=True)
+
+        dist.barrier()
+        if args.trace_offload:
+            for line in events[-50:]:
+                print(line, flush=True)
+    finally:
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        parallel_state.destroy_model_parallel()
+
+    return 0
+
+
+def run_cache_grouped_mlp_test(args: argparse.Namespace) -> int:
+    """Run test using CacheGroupedMLP with real Router and Dispatcher."""
+    if not HAVE_CACHE_GROUPED_MLP:
+        raise RuntimeError("CacheGroupedMLP not available")
+
     rank, world_size, _local_rank = _init_distributed()
 
     # EP only - each rank has access to all global experts
     ep_size = world_size
-    _initialize_model_parallel(ep=ep_size)
+    _initialize_model_parallel(tp=1, pp=1, ep=ep_size)
 
     # Set seeds
     torch.manual_seed(args.seed)
@@ -286,14 +412,20 @@ def main() -> int:
     bf16 = bool(args.bf16 and torch.cuda.is_bf16_supported())
     params_dtype = torch.bfloat16 if bf16 else torch.float32
 
+    num_global_experts = args.num_global_experts
+
     # Create config
     config = TransformerConfig(
         num_layers=args.num_layers,
         hidden_size=args.hidden_size,
-        num_attention_heads=128,
+        num_attention_heads=args.num_attention_heads,
         ffn_hidden_size=args.ffn_hidden_size,
         moe_ffn_hidden_size=args.ffn_hidden_size,
-        num_moe_experts=args.num_global_experts,
+        num_moe_experts=num_global_experts,
+        moe_layer_freq=1,
+        moe_router_topk=args.moe_router_topk,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type=args.moe_token_dispatcher_type,
         gated_linear_unit=True,
         activation_func=F.silu,
         add_bias_linear=False,
@@ -302,134 +434,169 @@ def main() -> int:
         moe_enable_expert_weight_cache=True,
         moe_activation_offload=args.activation_offload,
         use_cpu_initialization=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
     )
 
-    # Create ProcessGroupCollection for EP
+    # Create ProcessGroupCollection from parallel_state (pulls all default groups)
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+    # Get EP group from parallel_state
     ep_group = parallel_state.get_expert_model_parallel_group()
     ep_rank = dist.get_rank(ep_group)
-    pg_collection = ProcessGroupCollection(ep=ep_group)
 
-    # Create models for each layer
-    models = [
-        CacheGroupedMLP(
-            num_global_experts=args.num_global_experts,
-            config=config,
-            pg_collection=pg_collection,
-        )
-        for _ in range(args.num_layers)
-    ]
+    # Calculate local experts
+    num_local_experts = num_global_experts // ep_size
+    local_expert_indices = [ep_rank * num_local_experts + i for i in range(num_local_experts)]
+
+    # Create Router
+    router = TopKRouter(config=config, pg_collection=pg_collection)
+
+    # Create Dispatcher
+    dispatcher = MoEAlltoAllTokenDispatcher(
+        num_local_experts=num_local_experts,
+        local_expert_indices=local_expert_indices,
+        config=config,
+        pg_collection=pg_collection,
+    )
+
+    # Create CacheGroupedMLP (experts)
+    experts = CacheGroupedMLP(
+        num_global_experts=num_global_experts,
+        config=config,
+        pg_collection=pg_collection,
+    )
 
     if bf16:
-        models = [m.bfloat16() for m in models]
+        experts = experts.bfloat16()
 
-    for m in models:
-        m.train()
+    experts.train()
 
-    # Setup tracing (only for first model if tracing)
+    # Setup tracing
     events: List[str] = []
     if args.trace_offload:
-        events = _wrap_cache_calls(models[0], rank=rank)
+        events = _wrap_cache_grouped_mlp_calls(experts, rank=rank)
 
     device = torch.device("cuda")
 
-    # Calculate total tokens from batch_size and seq_len
-    total_tokens = args.batch_size * args.seq_len
-
-    # Set data seed (use model seed if not specified)
-    data_seed = args.data_seed if args.data_seed is not None else args.seed
-
     try:
         dist.barrier()
-        # Calculate experts per rank
-        my_experts = [e for e in range(args.num_global_experts) if e % ep_size == ep_rank]
-        all_experts_per_rank = [None] * ep_size
-        dist.all_gather_object(all_experts_per_rank, my_experts, group=ep_group)
 
         if rank == 0:
             print(
-                f"CacheGroupedMLP Test: iters={args.iters} world={world_size} "
-                f"num_layers={args.num_layers} batch_size={args.batch_size} seq_len={args.seq_len} "
-                f"experts={args.num_global_experts} num_sets={args.num_sets} "
+                f"CacheGroupedMLP Test (real Router+Dispatcher): "
+                f"iters={args.iters} world={world_size} "
+                f"batch_size={args.batch_size} seq_len={args.seq_len} "
+                f"experts={num_global_experts} local_experts={num_local_experts} "
                 f"hidden_size={args.hidden_size} ffn_hidden_size={args.ffn_hidden_size} "
                 f"dtype={'bf16' if bf16 else 'fp32'} "
                 f"activation_offload={args.activation_offload}",
                 flush=True,
             )
-            print("Expert distribution by EP rank:", flush=True)
-            for r, exp in enumerate(all_experts_per_rank):
-                print(f"  rank {r}: {len(exp)} experts {exp[:5]}{'...' if len(exp) > 5 else ''}", flush=True)
 
         total_forward_time = 0.0
         total_backward_time = 0.0
 
         for it in range(args.iters):
-            for m in models:
-                m.zero_grad(set_to_none=True)
+            experts.zero_grad(set_to_none=True)
 
-            # Generate test data with external scheduling
-            # Each rank only processes experts where expert_id % ep_size == ep_rank
-            # Use fixed data_seed for reproducible data generation (same data each iteration)
-            torch.manual_seed(data_seed)
-            avg_tokens_per_expert = total_tokens // len(my_experts) if my_experts else 0
-            expert_sets, tokens_per_expert_per_set, probs_per_set, hidden_states = (
-                generate_expert_sets_for_rank(
-                    num_global_experts=args.num_global_experts,
-                    ep_rank=ep_rank,
-                    ep_size=ep_size,
-                    num_sets=args.num_sets,
-                    avg_tokens_per_expert=avg_tokens_per_expert,
-                    hidden_size=args.hidden_size,
-                    dtype=params_dtype,
-                    device=device,
-                )
+            # Generate input hidden states [S, B, H] - standard format for router
+            batch_size = args.batch_size
+            seq_len = args.seq_len
+            hidden_size = args.hidden_size
+
+            # Random hidden states
+            hidden_states = torch.randn(
+                seq_len, batch_size, hidden_size,
+                dtype=params_dtype, device=device
+            )
+            hidden_states.requires_grad_(True)
+
+            # Forward pass timing
+            t0 = time.time()
+
+            # 1. Router - get routing probabilities and map
+            # Router expects [S, B, H] and returns probs, routing_map
+            probs, routing_map = router(hidden_states)
+
+            # 2. Preprocess for dispatcher
+            # Flatten to [S*B, H] for dispatcher
+            hidden_states_flat = hidden_states.view(-1, hidden_size)
+            hidden_states_flat, probs = dispatcher.dispatch_preprocess(
+                hidden_states_flat, routing_map, probs
             )
 
-            # Skip if no experts for this rank
-            if not expert_sets:
-                if rank == 0:
-                    print(f"iter {it}: no experts for rank {ep_rank}, skipping", flush=True)
-                continue
+            # 3. Token dispatch (AlltoAll communication)
+            hidden_states_flat, probs = dispatcher.token_dispatch(hidden_states_flat, probs)
 
-            # Forward through all layers
-            t0 = time.time()
-            hidden_states.requires_grad_(True)
-            intermediate = hidden_states
+            # 4. Postprocess dispatch - get expert inputs
+            expert_input, tokens_per_expert, permuted_probs = dispatcher.dispatch_postprocess(
+                hidden_states_flat, probs
+            )
 
-            for model in models:
-                output, _ = model(
-                    hidden_states=intermediate,
-                    tokens_per_expert_per_set=tokens_per_expert_per_set,
-                    probs_per_set=probs_per_set,
-                    expert_sets=expert_sets,
-                )
-                intermediate = output  # Pass to next layer
+            # 5. Expert computation with CacheGroupedMLP
+            # Convert dispatcher output to CacheGroupedMLP format
+            # CacheGroupedMLP expects:
+            #   - expert_sets: List[List[int]] - e.g., [[e1,e2], [e3,e4], ...]
+            #   - tokens_per_expert_per_set: List[torch.Tensor] - token counts per expert per set
+            #   - probs_per_set: List[torch.Tensor] - probabilities per token per set
+            #
+            # The dispatcher returns:
+            #   - expert_input: [total_tokens, hidden_size] - all tokens for local experts
+            #   - tokens_per_expert: [num_local_experts] - token count per local expert
+            #   - permuted_probs: [total_tokens] - probabilities for all tokens
+
+            # For now, use a single expert set containing all local experts
+            # The tokens are already sorted by expert in the dispatcher output
+            expert_sets = [local_expert_indices]
+            tokens_per_expert_per_set = [tokens_per_expert]
+            probs_per_set = [permuted_probs]
+
+            # Call CacheGroupedMLP
+            expert_output, _ = experts(
+                hidden_states=expert_input,
+                tokens_per_expert_per_set=tokens_per_expert_per_set,
+                probs_per_set=probs_per_set,
+                expert_sets=expert_sets,
+            )
+
+            # 6. Combine preprocess
+            output = dispatcher.combine_preprocess(expert_output)
+
+            # 7. Token combine (AlltoAll communication)
+            output = dispatcher.token_combine(output)
+
+            # 8. Combine postprocess
+            output = dispatcher.combine_postprocess(output)
 
             torch.cuda.synchronize()
             forward_time = time.time() - t0
             total_forward_time += forward_time
 
-            # Backward through all layers
+            # Backward pass timing
             t0 = time.time()
-            loss = intermediate.sum()
+
+            # Compute loss and backward
+            loss = output.sum()
             loss.backward()
+
+            # Sync gradients for CacheGroupedMLP
+            experts.sync_gradients()
+
             torch.cuda.synchronize()
             backward_time = time.time() - t0
             total_backward_time += backward_time
 
-            # Sync gradients for all layers
-            for m in models:
-                m.sync_gradients()
+            # Verify weights on CPU
+            _assert_weights_on_cpu(experts)
 
-            # Verify weights on CPU for first model
-            _assert_weights_on_cpu(models[0])
-
-            # Verify gradients for this rank's experts (first model)
-            assert models[0].weight1.grad is not None, "weight1.grad should be set after sync"
-            assert models[0].weight2.grad is not None, "weight2.grad should be set after sync"
+            # Verify gradients
+            assert experts.weight1.grad is not None, "weight1.grad should be set after sync"
+            assert experts.weight2.grad is not None, "weight2.grad should be set after sync"
 
             # Get token statistics
-            total_tokens = sum(t.sum().item() for t in tokens_per_expert_per_set)
-            num_experts_this_iter = sum(len(s) for s in expert_sets)
+            total_tokens = tokens_per_expert.sum().item() if tokens_per_expert.numel() > 0 else 0
+            num_experts_this_iter = len(local_expert_indices)
 
             print(
                 f"rank {ep_rank} iter {it}: experts={num_experts_this_iter} "
@@ -448,12 +615,13 @@ def main() -> int:
             print(f"  Num layers: {args.num_layers}")
             print(f"  Batch size: {args.batch_size}")
             print(f"  Seq length: {args.seq_len}")
-            print(f"  Total tokens: {total_tokens}")
-            print(f"  Data seed: {data_seed}")
+            print(f"  Total tokens per iteration: {args.batch_size * args.seq_len}")
+            print(f"  Num global experts: {num_global_experts}")
+            print(f"  Num local experts: {num_local_experts}")
+            print(f"  Router topk: {args.moe_router_topk}")
             print(f"  Avg forward time: {total_forward_time / args.iters:.3f}s")
             print(f"  Avg backward time: {total_backward_time / args.iters:.3f}s")
             print(f"  Total time: {total_forward_time + total_backward_time:.3f}s")
-            print(f"  External scheduling: each expert computed by one EP rank")
             print("=" * 60)
 
             if args.trace_offload and events:
@@ -462,6 +630,10 @@ def main() -> int:
                     print(f"  {line}")
 
     finally:
+        # Clean up shared memory
+        if hasattr(experts, 'release'):
+            experts.release()
+
         if dist.is_initialized():
             dist.barrier()
             dist.destroy_process_group()
@@ -470,10 +642,60 @@ def main() -> int:
     return 0
 
 
+def main() -> int:
+    os.environ.setdefault("NCCL_DEBUG", "ERROR")
+    os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
+
+    parser = argparse.ArgumentParser(
+        description="Distributed test for CacheGroupedMLP with full MoE pipeline"
+    )
+    # Test mode
+    parser.add_argument("--test-mode", type=str, default="cache_grouped_mlp",
+                        choices=["gpt_model", "cache_grouped_mlp"],
+                        help="Test mode: gpt_model (SequentialMLP) or cache_grouped_mlp")
+
+    # Common args
+    parser.add_argument("--iters", type=int, default=5)
+    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--seq-len", type=int, default=4096)
+    parser.add_argument("--hidden-size", type=int, default=2048)
+    parser.add_argument("--ffn-hidden-size", type=int, default=10240)
+    parser.add_argument("--num-attention-heads", type=int, default=8)
+    parser.add_argument("--bf16", action="store_true")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--trace-offload", action="store_true")
+    parser.add_argument("--activation-offload", action="store_true",
+                        help="Enable MoE input activation offload to CPU")
+
+    # GPTModel mode args
+    parser.add_argument("--vocab-size", type=int, default=128)
+    parser.add_argument("--num-local-experts", type=int, default=64,
+                        help="Number of local experts per rank (GPTModel mode)")
+    parser.add_argument("--moe-router-topk", type=int, default=8)
+    parser.add_argument("--moe-token-dispatcher-type", type=str, default="alltoall")
+    parser.add_argument("--use-flash-attn", action="store_true")
+    parser.add_argument("--use-transformer-engine", action="store_true")
+
+    # CacheGroupedMLP mode args
+    parser.add_argument("--num-global-experts", type=int, default=64,
+                        help="Number of global experts (CacheGroupedMLP mode)")
+
+    args = parser.parse_args()
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for this script")
+
+    if args.test_mode == "gpt_model":
+        return run_gpt_model_test(args)
+    else:
+        return run_cache_grouped_mlp_test(args)
+
+
 if __name__ == "__main__":
     try:
         torch.cuda.memory._record_memory_history()
-        main()
+        exit_code = main()
     finally:
         torch.cuda.memory._dump_snapshot("cache_grouped_mlp_memory_snapshot.pickle")
         torch.cuda.memory._record_memory_history(enabled=None)
