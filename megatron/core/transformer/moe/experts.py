@@ -2088,11 +2088,14 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
         # Prefetch first set
         if num_sets > 0 and len(expert_sets[0]) > 0:
             self._prefetch_expert_weights_async(expert_sets[0], current_buffer)
-
+        cpu_tokens_per_expert_list = [t.cpu() for t in tokens_per_expert_per_set]
         for set_idx, expert_ids in enumerate(expert_sets):
             tokens_per_expert = tokens_per_expert_per_set[set_idx]
             probs = probs_per_set[set_idx]
-            num_tokens = int(tokens_per_expert.sum().item())
+            # 获取对应的 CPU tensor
+            tokens_per_expert_cpu = cpu_tokens_per_expert_list[set_idx]
+            # 【关键修复】：在纯 CPU Tensor 上执行 sum() 和 item()，极速返回，0 阻塞！
+            num_tokens = int(tokens_per_expert_cpu.sum().item())
 
             if num_tokens == 0:
                 continue
@@ -2104,14 +2107,9 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             w1_gpu = self._w1_gpu_workspace[current_buffer, :len(expert_ids)]
             w2_gpu = self._w2_gpu_workspace[current_buffer, :len(expert_ids)]
 
-            # 3. Start prefetching next set (if exists)
-            next_set_idx = set_idx + 1
-            if next_set_idx < num_sets and len(expert_sets[next_set_idx]) > 0:
-                self._prefetch_expert_weights_async(expert_sets[next_set_idx], next_buffer)
-
             # 4. Execute current set's compute (on default stream)
             set_hidden_states = hidden_states[token_offset:token_offset + num_tokens]
-            tokens_per_expert_cpu = tokens_per_expert.cpu()
+            tokens_per_expert_cpu = cpu_tokens_per_expert_list[set_idx]
             probs_gpu = probs.to(device, non_blocking=True)
 
             # GroupedGEMM: fc1
@@ -2129,6 +2127,11 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
 
             output_list.append(fc2_output)
             token_offset += num_tokens
+            
+            # 3. Start prefetching next set (if exists)
+            next_set_idx = set_idx + 1
+            if next_set_idx < num_sets and len(expert_sets[next_set_idx]) > 0:
+                self._prefetch_expert_weights_async(expert_sets[next_set_idx], next_buffer)
 
             # 5. Swap buffers
             current_buffer, next_buffer = next_buffer, current_buffer
@@ -2185,11 +2188,15 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
         # Prefetch first set
         if num_sets > 0 and len(expert_sets[0]) > 0:
             self._prefetch_expert_weights_async(expert_sets[0], current_buffer)
-
+        cpu_tokens_per_expert_list = [t.cpu() for t in tokens_per_expert_per_set]
         for set_idx, expert_ids in enumerate(expert_sets):
-            tokens_per_expert = tokens_per_expert_per_set[set_idx]
+            # tokens_per_expert = tokens_per_expert_per_set[set_idx]
             probs = probs_per_set[set_idx]
-            num_tokens = int(tokens_per_expert.sum().item())
+            # 获取对应的 CPU tensor
+            tokens_per_expert_cpu = cpu_tokens_per_expert_list[set_idx]
+            
+            # 【关键修复】：在纯 CPU Tensor 上执行 sum() 和 item()，极速返回，0 阻塞！
+            num_tokens = int(tokens_per_expert_cpu.sum().item())
 
             if num_tokens == 0:
                 continue
@@ -2209,7 +2216,7 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             # 4. Execute current set's compute
             set_hidden_states = hidden_states[token_offset:token_offset + num_tokens]
             set_grad_output = grad_output[grad_offset:grad_offset + num_tokens]
-            tokens_per_expert_cpu = tokens_per_expert.cpu()
+            tokens_per_expert_cpu = cpu_tokens_per_expert_list[set_idx]
             probs_gpu = probs.to(device, non_blocking=True)
 
             with torch.enable_grad():
