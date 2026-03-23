@@ -1522,29 +1522,41 @@ class _GlobalBufferManager:
         ffn_hidden_size: int,
         dtype: torch.dtype,
         device: torch.device,
+        max_experts_per_set: Optional[int] = None,
     ):
-        """Initialize global shared buffers. Only creates new buffers if not already initialized."""
+        """Initialize global shared buffers. Only creates new buffers if not already initialized.
+
+        Args:
+            max_experts_per_set: Maximum number of experts in a single set. Defaults to
+                num_global_experts if not specified.
+        """
         if self._initialized:
             return
 
+        # Default max_experts_per_set to num_global_experts for safety
+        if max_experts_per_set is None:
+            max_experts_per_set = num_global_experts
+
         # Pinned buffers for H2D transfer (CPU -> GPU async transfer)
+        # Double-buffered to avoid implicit sync when next set writes while DMA is in progress
+        # Shape: [2 buffers, max_experts_per_set, ...]
         self._w1_h2d_pinned = torch.empty(
-            num_global_experts, hidden_size, fc1_out_features,
+            2, max_experts_per_set, hidden_size, fc1_out_features,
             dtype=dtype, device='cpu', pin_memory=True
         )
         self._w2_h2d_pinned = torch.empty(
-            num_global_experts, ffn_hidden_size, hidden_size,
+            2, max_experts_per_set, ffn_hidden_size, hidden_size,
             dtype=dtype, device='cpu', pin_memory=True
         )
 
         # GPU workspace (double-buffered for async prefetch)
-        # Shape: [2 buffers, max_experts_per_set (8), ...]
+        # Shape: [2 buffers, max_experts_per_set, ...]
         self._w1_gpu_workspace = torch.empty(
-            2, 8, hidden_size, fc1_out_features,
+            2, max_experts_per_set, hidden_size, fc1_out_features,
             dtype=dtype, device=device
         )
         self._w2_gpu_workspace = torch.empty(
-            2, 8, ffn_hidden_size, hidden_size,
+            2, max_experts_per_set, ffn_hidden_size, hidden_size,
             dtype=dtype, device=device
         )
 
@@ -1880,13 +1892,13 @@ class CacheGroupedMLP(MegatronModule):
         """
         num_experts = len(expert_ids)
 
-        # 1. CPU -> CPU (pinned memory) - on main thread
+        # 1. CPU -> CPU (pinned memory) - use buffer_idx for double buffering
         for i, exp_id in enumerate(expert_ids):
-            self._w1_h2d_pinned_buffer[i].copy_(self.weight1.data[exp_id])
-            self._w2_h2d_pinned_buffer[i].copy_(self.weight2.data[exp_id])
+            self._w1_h2d_pinned_buffer[buffer_idx, i].copy_(self.weight1.data[exp_id])
+            self._w2_h2d_pinned_buffer[buffer_idx, i].copy_(self.weight2.data[exp_id])
 
-        w1_pinned_view = self._w1_h2d_pinned_buffer[:num_experts]
-        w2_pinned_view = self._w2_h2d_pinned_buffer[:num_experts]
+        w1_pinned_view = self._w1_h2d_pinned_buffer[buffer_idx, :num_experts]
+        w2_pinned_view = self._w2_h2d_pinned_buffer[buffer_idx, :num_experts]
 
         # 2. Async transfer to GPU (on load_stream)
         w1_gpu = self._w1_gpu_workspace[buffer_idx, :num_experts]
