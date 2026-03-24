@@ -546,11 +546,27 @@ def run_cache_grouped_mlp_test(args: argparse.Namespace) -> int:
             #   - tokens_per_expert: [num_local_experts] - token count per local expert
             #   - permuted_probs: [total_tokens] - probabilities for all tokens
 
-            # For now, use a single expert set containing all local experts
-            # The tokens are already sorted by expert in the dispatcher output
-            expert_sets = [local_expert_indices]
-            tokens_per_expert_per_set = [tokens_per_expert]
-            probs_per_set = [permuted_probs]
+            # Split local experts into smaller sets to properly test double buffering
+            # and async weight prefetch. Using 2 experts per set.
+            experts_per_set = min(8, len(local_expert_indices))
+            expert_sets = []
+            tokens_per_expert_per_set = []
+            probs_per_set = []
+
+            token_offset = 0
+            for i in range(0, len(local_expert_indices), experts_per_set):
+                set_experts = local_expert_indices[i:i + experts_per_set]
+                expert_sets.append(set_experts)
+
+                # Get token counts for experts in this set
+                set_token_counts = tokens_per_expert[i:i + len(set_experts)]
+                tokens_per_expert_per_set.append(set_token_counts)
+
+                # Get total tokens for this set
+                num_tokens_in_set = int(set_token_counts.sum().item())
+                set_probs = permuted_probs[token_offset:token_offset + num_tokens_in_set]
+                probs_per_set.append(set_probs)
+                token_offset += num_tokens_in_set
 
             # Call CacheGroupedMLP
             expert_output, _ = experts(
@@ -597,10 +613,11 @@ def run_cache_grouped_mlp_test(args: argparse.Namespace) -> int:
             # Get token statistics
             total_tokens = tokens_per_expert.sum().item() if tokens_per_expert.numel() > 0 else 0
             num_experts_this_iter = len(local_expert_indices)
+            num_expert_sets = len(expert_sets)
 
             print(
                 f"rank {ep_rank} iter {it}: experts={num_experts_this_iter} "
-                f"total_tokens={total_tokens} "
+                f"sets={num_expert_sets} total_tokens={total_tokens} "
                 f"loss={loss.item():.6f} "
                 f"forward={forward_time:.3f}s backward={backward_time:.3f}s",
                 flush=True,

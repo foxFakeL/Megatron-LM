@@ -1623,7 +1623,7 @@ class _GlobalBufferManager:
         # CUDA streams (shared across layers)
         self._load_stream = torch.cuda.Stream()
         self._grad_offload_stream = torch.cuda.Stream()
-
+        self.compute_events = [torch.cuda.Event() for _ in range(2)]
         self._initialized = True
 
     def cleanup(self):
@@ -1920,6 +1920,7 @@ class CacheGroupedMLP(MegatronModule):
             ffn_hidden_size=ffn_hidden_size,
             dtype=config.params_dtype,
             device=device,
+            max_experts_per_set=16,
         )
 
         # Reference global buffers (no new allocation - just get references)
@@ -1970,20 +1971,14 @@ class CacheGroupedMLP(MegatronModule):
             Tuple of (w1_gpu, w2_gpu) - views into GPU workspace
         """
         num_experts = len(expert_ids)
-
-        # Get views of the expert weights directly from pinned shared memory
-        # No CPU copy needed - direct indexing into pinned SHM tensors
-        w1_shm_view = self.weight1.data[expert_ids]
-        w2_shm_view = self.weight2.data[expert_ids]
-
-        # GPU workspace for this buffer
         w1_gpu = self._w1_gpu_workspace[buffer_idx, :num_experts]
         w2_gpu = self._w2_gpu_workspace[buffer_idx, :num_experts]
-
-        # Direct DMA transfer from pinned shared memory to GPU
+        _global_buffer_manager.compute_events[buffer_idx].wait(self._load_stream)
         with torch.cuda.stream(self._load_stream):
-            w1_gpu.copy_(w1_shm_view, non_blocking=True)
-            w2_gpu.copy_(w2_shm_view, non_blocking=True)
+            for i, exp_id in enumerate(expert_ids):
+                # 从 Pinned Memory 的 View 中零拷贝拉取数据
+                w1_gpu[i].copy_(self.weight1.data[exp_id], non_blocking=True)
+                w2_gpu[i].copy_(self.weight2.data[exp_id], non_blocking=True)
 
         return w1_gpu, w2_gpu
 
@@ -2001,19 +1996,13 @@ class CacheGroupedMLP(MegatronModule):
         Uses a dedicated CUDA stream for async D2H transfer, allowing overlap with
         next expert set's weight prefetch.
         """
-        num_experts = len(expert_ids)
-
-        # Get views of gradient buffers directly from pinned shared memory
-        grad_w1_shm_view = self._grad_weight1[expert_ids]
-        grad_w2_shm_view = self._grad_weight2[expert_ids]
-
-        # Direct D2H transfer to pinned shared memory
         with torch.cuda.stream(self._grad_offload_stream):
-            grad_w1_shm_view.copy_(grad_w1, non_blocking=True)
-            grad_w2_shm_view.copy_(grad_w2, non_blocking=True)
-
-        # Wait for D2H to complete before CPU reads
-        torch.cuda.current_stream().wait_stream(self._grad_offload_stream)
+            for i, exp_id in enumerate(expert_ids):
+                # exp_id 是整数，索引返回的是 Pinned Memory 的 View
+                # 这样 copy_ 才能真正写回 Shared Memory，且 non_blocking 才能生效
+                # 注意：如果同一个 batch 有多个 set 访问同一个 expert，这里需要改成 add_ (梯度累加)
+                self._grad_weight1[exp_id].copy_(grad_w1[i], non_blocking=True)
+                self._grad_weight2[exp_id].copy_(grad_w2[i], non_blocking=True)
             
 
     def sync_gradients(self):
@@ -2026,6 +2015,8 @@ class CacheGroupedMLP(MegatronModule):
             With external scheduling (each expert computed by one rank), no
             allreduce is needed. Gradients are directly attached to parameters.
         """
+        if self._grad_offload_stream is not None:
+            self._grad_offload_stream.synchronize()
         self.weight1.grad = self._grad_weight1
         self.weight2.grad = self._grad_weight2
 
@@ -2235,7 +2226,7 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             fc2_output = gg.ops.gmm(
                 intermediate, w2_gpu, tokens_per_expert_cpu, trans_b=False
             )
-
+            _global_buffer_manager.compute_events[current_buffer].record(torch.cuda.current_stream())
             output_list.append(fc2_output)
             token_offset += num_tokens
             
