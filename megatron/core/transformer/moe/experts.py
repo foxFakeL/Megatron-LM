@@ -2003,6 +2003,11 @@ class CacheGroupedMLP(MegatronModule):
                 # 注意：如果同一个 batch 有多个 set 访问同一个 expert，这里需要改成 add_ (梯度累加)
                 self._grad_weight1[exp_id].copy_(grad_w1[i], non_blocking=True)
                 self._grad_weight2[exp_id].copy_(grad_w2[i], non_blocking=True)
+            # Critical: Lock memory lifetime to prevent GPU memory reuse before copy completes
+            # Without this, default stream may reallocate grad_w1/grad_w2 memory while
+            # async D2H copy is still in progress, corrupting the data
+            grad_w1.record_stream(self._grad_offload_stream)
+            grad_w2.record_stream(self._grad_offload_stream)
             
 
     def sync_gradients(self):
@@ -2132,8 +2137,20 @@ class CacheGroupedMLP(MegatronModule):
         Returns:
             Tuple of (output, None) where output is [total_tokens, hidden_size]
         """
+        # Flatten probs_per_set into a single tensor for proper gradient propagation
+        # PyTorch autograd.Function cannot correctly propagate gradients through List[Tensor]
+        probs_flat = torch.cat([p for p in probs_per_set if p.numel() > 0], dim=0)
+
+        # Compute offsets for each set to slice probs_flat in forward/backward
+        probs_offsets = []
+        offset = 0
+        for p in probs_per_set:
+            probs_offsets.append(offset)
+            if p.numel() > 0:
+                offset += p.numel()
+
         return CacheGroupedMLPFunction.apply(
-            self, hidden_states, tokens_per_expert_per_set, probs_per_set, expert_sets
+            self, hidden_states, tokens_per_expert_per_set, probs_flat, probs_offsets, expert_sets
         )
 
     def backward_dw(self):
@@ -2160,25 +2177,29 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
         self: CacheGroupedMLP,
         hidden_states: torch.Tensor,
         tokens_per_expert_per_set: List[torch.Tensor],
-        probs_per_set: List[torch.Tensor],
+        probs_flat: torch.Tensor,
+        probs_offsets: List[int],
         expert_sets: List[List[int]],
     ):
         ctx.self = self
         ctx.expert_sets = expert_sets
         ctx.num_sets = len(expert_sets)
+        ctx.probs_offsets = probs_offsets
 
         # Offload activation to CPU asynchronously (overlaps with weight loading and compute)
         if self.activation_offload:
             self.activation_cache.offload_to_cpu_async(hidden_states)
-            ctx.save_for_backward(*tokens_per_expert_per_set, *probs_per_set)
+            # Don't save hidden_states - it's offloaded to CPU via activation_cache
+            ctx.save_for_backward(probs_flat, *tokens_per_expert_per_set)
             ctx.activation_offloaded = True
         else:
-            ctx.save_for_backward(hidden_states, *tokens_per_expert_per_set, *probs_per_set)
+            ctx.save_for_backward(hidden_states, probs_flat, *tokens_per_expert_per_set)
             ctx.activation_offloaded = False
 
         device = hidden_states.device
         output_list = []
         token_offset = 0
+        probs_offset = 0  # Track position in probs_flat
 
         nvtx.range_push("CacheGroupedMLP::forward")
 
@@ -2192,8 +2213,6 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             self._prefetch_expert_weights_async(expert_sets[0], current_buffer)
         cpu_tokens_per_expert_list = [t.cpu() for t in tokens_per_expert_per_set]
         for set_idx, expert_ids in enumerate(expert_sets):
-            tokens_per_expert = tokens_per_expert_per_set[set_idx]
-            probs = probs_per_set[set_idx]
             # 获取对应的 CPU tensor
             tokens_per_expert_cpu = cpu_tokens_per_expert_list[set_idx]
             # 【关键修复】：在纯 CPU Tensor 上执行 sum() 和 item()，极速返回，0 阻塞！
@@ -2212,7 +2231,9 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             # 4. Execute current set's compute (on default stream)
             set_hidden_states = hidden_states[token_offset:token_offset + num_tokens]
             tokens_per_expert_cpu = cpu_tokens_per_expert_list[set_idx]
-            probs_gpu = probs.to(device, non_blocking=True)
+            # Slice probs from flattened tensor using dynamic offset
+            probs_gpu = probs_flat[probs_offset:probs_offset + num_tokens].to(device, non_blocking=True)
+            probs_offset += num_tokens
 
             # GroupedGEMM: fc1
             fc1_output = gg.ops.gmm(
@@ -2229,7 +2250,7 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             _global_buffer_manager.compute_events[current_buffer].record(torch.cuda.current_stream())
             output_list.append(fc2_output)
             token_offset += num_tokens
-            
+
             # 3. Start prefetching next set (if exists)
             next_set_idx = set_idx + 1
             if next_set_idx < num_sets and len(expert_sets[next_set_idx]) > 0:
@@ -2259,27 +2280,33 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
         self: CacheGroupedMLP = ctx.self
         expert_sets: List[List[int]] = ctx.expert_sets
         num_sets: int = ctx.num_sets
+        probs_offsets: List[int] = ctx.probs_offsets
 
         # Load activation from CPU if offloaded, otherwise use saved tensor
+        # Saved tensors structure:
+        #   activation_offloaded=True:  [probs_flat, tokens_per_expert_per_set...]
+        #   activation_offloaded=False: [hidden_states, probs_flat, tokens_per_expert_per_set...]
         if ctx.activation_offloaded:
             # Wait for async offload to complete before loading back
             self.activation_cache.wait_offload()
             saved_tensors = ctx.saved_tensors
-            tokens_per_expert_per_set = list(saved_tensors[:num_sets])
-            probs_per_set = list(saved_tensors[num_sets:2*num_sets])
+            probs_flat = saved_tensors[0]
+            tokens_per_expert_per_set = list(saved_tensors[1:])
             hidden_states = self.activation_cache.load_to_device(
                 grad_output.device, non_blocking=True
             )
         else:
             saved_tensors = ctx.saved_tensors
             hidden_states = saved_tensors[0]
-            tokens_per_expert_per_set = list(saved_tensors[1:num_sets+1])
-            probs_per_set = list(saved_tensors[num_sets+1:2*num_sets+1])
+            probs_flat = saved_tensors[1]
+            tokens_per_expert_per_set = list(saved_tensors[2:])
 
         device = grad_output.device
         grad_input_list = []
+        grad_probs_list = []  # Collect gradient for probs
         token_offset = 0
         grad_offset = 0
+        probs_offset = 0  # Track position in probs_flat
 
         nvtx.range_push("CacheGroupedMLP::backward")
 
@@ -2292,11 +2319,9 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             self._prefetch_expert_weights_async(expert_sets[0], current_buffer)
         cpu_tokens_per_expert_list = [t.cpu() for t in tokens_per_expert_per_set]
         for set_idx, expert_ids in enumerate(expert_sets):
-            # tokens_per_expert = tokens_per_expert_per_set[set_idx]
-            probs = probs_per_set[set_idx]
             # 获取对应的 CPU tensor
             tokens_per_expert_cpu = cpu_tokens_per_expert_list[set_idx]
-            
+
             # 【关键修复】：在纯 CPU Tensor 上执行 sum() 和 item()，极速返回，0 阻塞！
             num_tokens = int(tokens_per_expert_cpu.sum().item())
 
@@ -2319,27 +2344,32 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
             set_hidden_states = hidden_states[token_offset:token_offset + num_tokens]
             set_grad_output = grad_output[grad_offset:grad_offset + num_tokens]
             tokens_per_expert_cpu = cpu_tokens_per_expert_list[set_idx]
-            probs_gpu = probs.to(device, non_blocking=True)
+            # Slice probs from flattened tensor using dynamic offset
+            probs_gpu = probs_flat[probs_offset:probs_offset + num_tokens].to(device, non_blocking=True)
 
             with torch.enable_grad():
                 # Detach and require grad for recomputation
+                # CRITICAL: All inputs must be detached to break from the original computation graph
+                # This prevents memory leak from stale graph history
                 set_hidden_states_req = set_hidden_states.detach().requires_grad_(True)
                 w1_gpu_req = w1_gpu.detach().requires_grad_(True)
                 w2_gpu_req = w2_gpu.detach().requires_grad_(True)
+                # Detach probs to compute its gradient for Router
+                probs_gpu_req = probs_gpu.detach().requires_grad_(True)
 
                 # Forward
                 fc1_output = gg.ops.gmm(
                     set_hidden_states_req, w1_gpu_req, tokens_per_expert_cpu, trans_b=False
                 )
-                intermediate = self.activation_func(fc1_output) * probs_gpu.unsqueeze(-1)
+                intermediate = self.activation_func(fc1_output) * probs_gpu_req.unsqueeze(-1)
                 fc2_output = gg.ops.gmm(
                     intermediate, w2_gpu_req, tokens_per_expert_cpu, trans_b=False
                 )
 
-                # Compute gradients
+                # Compute gradients - include probs_gpu_req for Router gradient
                 grads = torch.autograd.grad(
                     outputs=fc2_output,
-                    inputs=(set_hidden_states_req, w1_gpu_req, w2_gpu_req),
+                    inputs=(set_hidden_states_req, w1_gpu_req, w2_gpu_req, probs_gpu_req),
                     grad_outputs=set_grad_output,
                     retain_graph=False,
                     create_graph=False,
@@ -2349,13 +2379,21 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
                 grad_input = grads[0]
                 grad_w1 = grads[1]
                 grad_w2 = grads[2]
+                grad_probs = grads[3]  # Gradient for probs
 
             # Offload gradients to CPU
             self._offload_grads_to_cpu(expert_ids, grad_w1, grad_w2)
 
             grad_input_list.append(grad_input)
+            grad_probs_list.append(grad_probs)
             token_offset += num_tokens
             grad_offset += num_tokens
+            probs_offset += num_tokens
+
+            # Record event before buffer swap to prevent WAR hazard
+            # This ensures async prefetch on _load_stream won't overwrite current buffer
+            # while backward compute is still using it
+            _global_buffer_manager.compute_events[current_buffer].record(torch.cuda.current_stream())
 
             # 5. Swap buffers
             current_buffer, next_buffer = next_buffer, current_buffer
@@ -2369,5 +2407,11 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
                 0, self.config.hidden_size, device=device, dtype=grad_output.dtype
             )
 
-        # Return gradients: (self, hidden_states, tokens_per_expert_per_set, probs_per_set, expert_sets)
-        return None, grad_input, None, None, None
+        # Concatenate probs gradients
+        if grad_probs_list:
+            grad_probs_flat = torch.cat(grad_probs_list, dim=0)
+        else:
+            grad_probs_flat = torch.empty(0, device=device, dtype=grad_output.dtype)
+
+        # Return gradients: (self, hidden_states, tokens_per_expert_per_set, probs_flat, probs_offsets, expert_sets)
+        return None, grad_input, None, grad_probs_flat, None, None
