@@ -46,7 +46,13 @@ from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispa
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.utils import get_te_version
-from megatron.training.utils import get_ltor_masks_and_position_ids
+
+# Import for GPT model test - may not be available in all environments
+try:
+    from megatron.training.utils import get_ltor_masks_and_position_ids
+    HAVE_LTOR_MASKS = True
+except ImportError:
+    HAVE_LTOR_MASKS = False
 
 # Import CacheGroupedMLP for direct testing
 try:
@@ -55,9 +61,23 @@ try:
 except ImportError:
     HAVE_CACHE_GROUPED_MLP = False
 
+# Import FusedDispatcherCacheGroupedMLP for testing
+try:
+    from megatron.core.transformer.moe.experts import FusedDispatcherCacheGroupedMLP
+    HAVE_FUSED_DISPATCHER_MLP = True
+except ImportError:
+    HAVE_FUSED_DISPATCHER_MLP = False
+
 
 def _init_distributed() -> Tuple[int, int, int]:
     """Initialize distributed process group."""
+    # Set default environment variables for single-GPU case
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+    os.environ.setdefault("MASTER_ADDR", "localhost")
+    os.environ.setdefault("MASTER_PORT", "29500")
+
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
 
@@ -238,6 +258,9 @@ def _assert_weights_on_cpu(model: 'CacheGroupedMLP') -> None:
 
 def run_gpt_model_test(args: argparse.Namespace) -> int:
     """Run test using GPTModel with SequentialMLP (reference implementation)."""
+    if not HAVE_LTOR_MASKS:
+        raise RuntimeError("megatron.training.utils not available - cannot run GPT model test")
+
     rank, world_size, _local_rank = _init_distributed()
 
     tp_size = 1
@@ -659,6 +682,217 @@ def run_cache_grouped_mlp_test(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_fused_dispatcher_mlp_test(args: argparse.Namespace) -> int:
+    """Run test using FusedDispatcherCacheGroupedMLP with Router (no external dispatcher).
+
+    FusedDispatcherCacheGroupedMLP handles all_to_all communication internally,
+    so no separate token dispatcher is needed.
+    """
+    if not HAVE_FUSED_DISPATCHER_MLP:
+        raise RuntimeError("FusedDispatcherCacheGroupedMLP not available")
+
+    rank, world_size, _local_rank = _init_distributed()
+
+    # EP only - each rank processes a subset of experts
+    ep_size = world_size
+    _initialize_model_parallel(tp=1, pp=1, ep=ep_size)
+
+    # Set seeds
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    model_parallel_cuda_manual_seed(args.seed)
+
+    # Setup dtype
+    bf16 = bool(args.bf16 and torch.cuda.is_bf16_supported())
+    params_dtype = torch.bfloat16 if bf16 else torch.float32
+
+    num_global_experts = args.num_global_experts
+
+    # Create config
+    config = TransformerConfig(
+        num_layers=args.num_layers,
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.num_attention_heads,
+        ffn_hidden_size=args.ffn_hidden_size,
+        moe_ffn_hidden_size=args.ffn_hidden_size,
+        num_moe_experts=num_global_experts,
+        moe_layer_freq=1,
+        moe_router_topk=args.moe_router_topk,
+        moe_router_pre_softmax=True,
+        moe_token_dispatcher_type=args.moe_token_dispatcher_type,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        add_bias_linear=False,
+        bf16=bf16,
+        params_dtype=params_dtype,
+        moe_enable_expert_weight_cache=True,
+        moe_activation_offload=args.activation_offload,
+        use_cpu_initialization=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
+
+    # Create ProcessGroupCollection from parallel_state
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+    # Get EP group from parallel_state
+    ep_group = parallel_state.get_expert_model_parallel_group()
+    ep_rank = dist.get_rank(ep_group)
+
+    # Create Router (for routing_map and probs)
+    router = TopKRouter(config=config, pg_collection=pg_collection)
+
+    # Create FusedDispatcherCacheGroupedMLP (no external dispatcher needed!)
+    experts = FusedDispatcherCacheGroupedMLP(
+        num_global_experts=num_global_experts,
+        config=config,
+        pg_collection=pg_collection,
+    )
+
+    if bf16:
+        experts = experts.bfloat16()
+
+    experts.train()
+
+    # Define expert_sets: partition experts across ranks
+    # Each rank processes its share of experts
+    experts_per_rank = num_global_experts // ep_size
+    local_expert_start = ep_rank * experts_per_rank
+    expert_sets = [[local_expert_start + i for i in range(experts_per_rank)]]
+
+    # Setup tracing
+    events: List[str] = []
+    if args.trace_offload:
+        events = _wrap_cache_grouped_mlp_calls(experts, rank=rank)
+
+    device = torch.device("cuda")
+    hidden_size = args.hidden_size
+    batch_size = args.batch_size
+    seq_len = args.seq_len
+
+    try:
+        dist.barrier()
+
+        if rank == 0:
+            print(
+                f"FusedDispatcherCacheGroupedMLP Test (fused dispatcher): "
+                f"iters={args.iters} world={world_size} "
+                f"batch_size={batch_size} seq_len={seq_len} "
+                f"experts={num_global_experts} experts_per_rank={experts_per_rank} "
+                f"hidden_size={hidden_size} ffn_hidden_size={args.ffn_hidden_size} "
+                f"dtype={'bf16' if bf16 else 'fp32'} "
+                f"activation_offload={args.activation_offload}",
+                flush=True,
+            )
+
+        total_forward_time = 0.0
+        total_backward_time = 0.0
+
+        for it in range(args.iters):
+            experts.zero_grad(set_to_none=True)
+
+            # Generate hidden states [S, B, H] - standard format for router
+            hidden_states = torch.randn(
+                seq_len, batch_size, hidden_size,
+                dtype=params_dtype, device=device
+            )
+            hidden_states.requires_grad_(True)
+
+            # Forward pass timing
+            t0 = time.time()
+
+            # 1. Router - get routing probabilities and map
+            # Router expects [S, B, H] and returns probs, routing_map
+            probs, routing_map = router(hidden_states)
+
+            # 2. Flatten for FusedDispatcherCacheGroupedMLP
+            # hidden_states: [S, B, H] -> [S*B, H]
+            hidden_states_flat = hidden_states.view(-1, hidden_size)
+            # probs: [S, B, num_experts] -> [S*B, num_experts]
+            probs_flat = probs.view(-1, num_global_experts)
+            # routing_map: [S, B, num_experts] -> [S*B, num_experts]
+            routing_map_flat = routing_map.view(-1, num_global_experts)
+
+            # 3. Call FusedDispatcherCacheGroupedMLP - handles all_to_all internally!
+            output, _ = experts(
+                hidden_states=hidden_states_flat,
+                routing_map=routing_map_flat,
+                probs=probs_flat,
+                expert_sets=expert_sets,
+            )
+
+            torch.cuda.synchronize()
+            forward_time = time.time() - t0
+            total_forward_time += forward_time
+
+            # Backward pass timing
+            t0 = time.time()
+
+            # Compute loss and backward
+            loss = output.sum()
+            loss.backward()
+
+            # Sync gradients for FusedDispatcherCacheGroupedMLP
+            experts.sync_gradients()
+
+            torch.cuda.synchronize()
+            backward_time = time.time() - t0
+            total_backward_time += backward_time
+
+            # Verify weights on CPU
+            _assert_weights_on_cpu(experts)
+
+            # Verify gradients
+            assert experts.weight1.grad is not None, "weight1.grad should be set after sync"
+            assert experts.weight2.grad is not None, "weight2.grad should be set after sync"
+
+            # Get token statistics
+            total_tokens = batch_size * seq_len
+
+            print(
+                f"rank {ep_rank} iter {it}: experts={experts_per_rank} "
+                f"total_tokens={total_tokens} "
+                f"loss={loss.item():.6f} "
+                f"forward={forward_time:.3f}s backward={backward_time:.3f}s",
+                flush=True,
+            )
+
+        dist.barrier()
+
+        # Print summary
+        if rank == 0:
+            print("\n" + "=" * 60)
+            print("Summary:")
+            print(f"  Num layers: {args.num_layers}")
+            print(f"  Batch size: {batch_size}")
+            print(f"  Seq length: {seq_len}")
+            print(f"  Total tokens per iteration: {batch_size * seq_len}")
+            print(f"  Num global experts: {num_global_experts}")
+            print(f"  Experts per rank: {experts_per_rank}")
+            print(f"  Router topk: {args.moe_router_topk}")
+            print(f"  Avg forward time: {total_forward_time / args.iters:.3f}s")
+            print(f"  Avg backward time: {total_backward_time / args.iters:.3f}s")
+            print(f"  Total time: {total_forward_time + total_backward_time:.3f}s")
+            print("=" * 60)
+
+            if args.trace_offload and events:
+                print("\nTrace events (last 50):")
+                for line in events[-50:]:
+                    print(f"  {line}")
+
+    finally:
+        # Clean up
+        if hasattr(experts, 'release'):
+            experts.release()
+
+        if dist.is_initialized():
+            dist.barrier()
+            dist.destroy_process_group()
+        parallel_state.destroy_model_parallel()
+
+    return 0
+
+
 def main() -> int:
     os.environ.setdefault("NCCL_DEBUG", "ERROR")
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
@@ -668,8 +902,8 @@ def main() -> int:
     )
     # Test mode
     parser.add_argument("--test-mode", type=str, default="cache_grouped_mlp",
-                        choices=["gpt_model", "cache_grouped_mlp"],
-                        help="Test mode: gpt_model (SequentialMLP) or cache_grouped_mlp")
+                        choices=["gpt_model", "cache_grouped_mlp", "fused_dispatcher_mlp"],
+                        help="Test mode: gpt_model (SequentialMLP), cache_grouped_mlp, or fused_dispatcher_mlp")
 
     # Common args
     parser.add_argument("--iters", type=int, default=5)
@@ -705,8 +939,10 @@ def main() -> int:
 
     if args.test_mode == "gpt_model":
         return run_gpt_model_test(args)
-    else:
+    elif args.test_mode == "cache_grouped_mlp":
         return run_cache_grouped_mlp_test(args)
+    else:  # fused_dispatcher_mlp
+        return run_fused_dispatcher_mlp_test(args)
 
 
 if __name__ == "__main__":
