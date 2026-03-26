@@ -758,8 +758,13 @@ def run_fused_dispatcher_mlp_test(args: argparse.Namespace) -> int:
     # Each rank processes its share of experts
     experts_per_rank = num_global_experts // ep_size
     local_expert_start = ep_rank * experts_per_rank
-    expert_sets = [[local_expert_start + i for i in range(experts_per_rank)]]
-
+    expert_list = [local_expert_start + i for i in range(experts_per_rank)]
+    experts_per_set = 4
+    expert_sets = [
+        expert_list[i : i + experts_per_set] 
+        for i in range(0, len(expert_list), experts_per_set)
+    ]
+    print("rank ", ep_rank, ", process ", expert_sets)
     # Setup tracing
     events: List[str] = []
     if args.trace_offload:

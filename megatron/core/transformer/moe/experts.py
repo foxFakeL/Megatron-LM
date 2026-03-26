@@ -2431,17 +2431,26 @@ class CacheGroupedMLPFunction(torch.autograd.Function):
 
 
 class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
-    """EP-only MoE with real cross-rank All-to-All and 3-stream pipeline.
+    """EP-only MoE with Global-Schedule-Based All-to-All Pipeline.
+
+    CRITICAL DESIGN: Schedule-Based Synchronized Pipeline
+    - Phase 0: All ranks exchange COMPLETE global schedule (global_expert_sets)
+    - Phase 1+: Every rank participates in EVERY all_to_all UNCONDITIONALLY
+
+    Key principle: The set_idx loop acts as a natural global barrier.
+    Every rank iterates over the same set_idx values and unconditionally
+    calls all_to_all_single, preventing deadlocks.
 
     Architecture:
-    - Phase 0: Lightweight metadata all_gather to get global token distribution
-    - Phase 1: For each set, dispatch (all_to_all) -> compute (GEMM) -> combine (all_to_all)
-    - Phase 2: Backward without monolithic tensor saving
+    - Phase 0: Exchange global schedule + token distribution
+    - Phase 1: For each set_idx, UNCONDITIONAL dispatch -> compute -> combine
+    - Phase 2: Backward with UNCONDITIONAL reverse all_to_all
 
     Key features:
     - Real cross-rank communication via torch.distributed.all_to_all_single
     - Three CUDA streams: compute (default), load (PCIe weight), comm (NVLink all-to-all)
     - Memory-efficient backward: saves only dispatched tokens per set, not full hidden_states
+    - NO conditional skips in all_to_all - NCCL handles 0-size tensors correctly
     """
 
     def __init__(
@@ -2470,33 +2479,33 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
         self._compute_events = [torch.cuda.Event() for _ in range(2)]
         self._load_events = [torch.cuda.Event() for _ in range(2)]
 
-        # NOTE: Expert ownership is DYNAMIC, determined by expert_sets passed to forward()
-        # We do NOT use static expert_id // num_local_experts anymore
-        # The expert_to_rank mapping is built dynamically in Phase 0
-
     def _phase0_exchange_metadata(
         self,
         routing_map: torch.Tensor,
         expert_sets: List[List[int]],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Lightweight all_gather to get global token distribution and DYNAMIC expert_to_rank mapping.
+    ) -> Tuple[torch.Tensor, List[List[List[int]]]]:
+        """Exchange global schedule and token distribution.
 
-        This is the ONLY metadata exchange - no hidden_states movement.
+        CRITICAL: This function ensures ALL ranks know the COMPLETE schedule
+        of which experts every rank processes at each set_idx.
 
         Args:
             routing_map: [num_tokens, num_global_experts] boolean routing map
-            expert_sets: List of expert ID lists, one per set
+            expert_sets: List of expert ID lists - experts THIS rank processes per set
 
         Returns:
             global_tokens_distribution: [ep_size, num_global_experts] tensor on CPU
                 global_tokens_distribution[ep_rank][expert_id] = number of tokens
                 from ep_rank that are routed to expert_id
-            expert_to_rank: [num_global_experts] tensor on CPU
-                expert_to_rank[expert_id] = EP rank that processes this expert
+            global_expert_sets: [ep_size][num_sets][experts] - COMPLETE schedule
+                global_expert_sets[ep_rank][set_idx] = list of expert IDs
+                that ep_rank will process at set_idx
         """
         num_global_experts = self.num_global_experts
-        device = routing_map.device  # Get device for GPU-first communication
+        device = routing_map.device
+        num_sets = len(expert_sets)
 
+        # ============ Part 1: All-gather token distribution ============
         # Local token count per expert (on GPU)
         local_tokens_per_expert = routing_map.sum(dim=0).long()  # [num_global_experts]
 
@@ -2508,253 +2517,204 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
         if self.ep_size > 1:
             torch.distributed.all_gather_into_tensor(
                 global_tokens_distribution_gpu,
-                local_tokens_per_expert,  # Keep on GPU
+                local_tokens_per_expert,
                 group=self.ep_group
             )
         else:
-            # Single rank: just copy local distribution
             global_tokens_distribution_gpu[0] = local_tokens_per_expert
 
-        # Now copy to CPU (after GPU communication is done)
+        # Copy to CPU after GPU communication is done
         global_tokens_distribution = global_tokens_distribution_gpu.cpu()
 
-        # Build DYNAMIC expert_to_rank mapping from expert_sets
-        # Each rank announces which experts it will process (those in its expert_sets)
-        local_experts_to_process = []
-        for expert_ids in expert_sets:
-            local_experts_to_process.extend(expert_ids)
+        # ============ Part 2: All-gather expert_sets (global schedule) ============
+        # Each rank contributes its expert_sets (experts IT processes per set)
+        # We need to communicate variable-length lists, so we use a fixed-size tensor
 
-        # Create boolean mask on GPU: experts_per_rank[rank][expert_id] = True if rank processes expert
-        experts_per_rank_gpu = torch.zeros(self.ep_size, num_global_experts, dtype=torch.bool, device=device)
-        for exp_id in local_experts_to_process:
-            experts_per_rank_gpu[self.ep_rank][exp_id] = True
+        # First, communicate the number of sets (should be same across all ranks)
+        num_sets_tensor = torch.tensor([num_sets], dtype=torch.long, device=device)
+        if self.ep_size > 1:
+            all_num_sets = torch.empty(self.ep_size, dtype=torch.long, device=device)
+            torch.distributed.all_gather_into_tensor(
+                all_num_sets, num_sets_tensor, group=self.ep_group
+            )
+            # Verify all ranks have the same number of sets
+            if not torch.all(all_num_sets == num_sets):
+                raise RuntimeError(
+                    f"All ranks must have the same number of expert sets! "
+                    f"Got {all_num_sets.tolist()}, expected {num_sets}"
+                )
+
+        # Communicate max experts per set for buffer allocation
+        max_experts_per_set = max(len(s) for s in expert_sets) if expert_sets else 0
+        max_experts_tensor = torch.tensor([max_experts_per_set], dtype=torch.long, device=device)
+        if self.ep_size > 1:
+            all_max_experts = torch.empty(self.ep_size, dtype=torch.long, device=device)
+            torch.distributed.all_gather_into_tensor(
+                all_max_experts, max_experts_tensor, group=self.ep_group
+            )
+            global_max_experts = int(all_max_experts.max().item())
+        else:
+            global_max_experts = max_experts_per_set
+
+        # Create fixed-size tensor for expert_sets communication
+        # Shape: [ep_size, num_sets, global_max_experts]
+        # Use -1 as padding for unused slots
+        expert_sets_tensor = torch.full(
+            (num_sets, global_max_experts), -1, dtype=torch.long, device=device
+        )
+        for set_idx, exp_ids in enumerate(expert_sets):
+            expert_sets_tensor[set_idx, :len(exp_ids)] = torch.tensor(exp_ids, device=device)
 
         if self.ep_size > 1:
-            # All-gather on GPU which experts each rank will process
-            global_experts_per_rank_gpu = torch.empty_like(experts_per_rank_gpu)
+            global_expert_sets_tensor = torch.empty(
+                self.ep_size, num_sets, global_max_experts, dtype=torch.long, device=device
+            )
             torch.distributed.all_gather_into_tensor(
-                global_experts_per_rank_gpu.flatten(),
-                experts_per_rank_gpu.flatten(),
+                global_expert_sets_tensor.flatten(),
+                expert_sets_tensor.flatten(),
                 group=self.ep_group
             )
-            global_experts_per_rank_gpu = global_experts_per_rank_gpu.view(self.ep_size, num_global_experts)
         else:
-            global_experts_per_rank_gpu = experts_per_rank_gpu
+            global_expert_sets_tensor = expert_sets_tensor.unsqueeze(0)
 
-        # Copy to CPU for building expert_to_rank
-        global_experts_per_rank = global_experts_per_rank_gpu.cpu()
+        # Convert tensor back to nested lists, removing padding (-1 values)
+        global_expert_sets: List[List[List[int]]] = []
+        for rank_idx in range(self.ep_size):
+            rank_sets: List[List[int]] = []
+            for set_idx in range(num_sets):
+                expert_ids = global_expert_sets_tensor[rank_idx, set_idx].tolist()
+                # Filter out -1 padding values
+                expert_ids = [e for e in expert_ids if e >= 0]
+                rank_sets.append(expert_ids)
+            global_expert_sets.append(rank_sets)
 
-        # Build expert_to_rank: for each expert, which rank processes it?
-        expert_to_rank = torch.zeros(num_global_experts, dtype=torch.long, device='cpu')
-        for exp_id in range(num_global_experts):
-            for rank in range(self.ep_size):
-                if global_experts_per_rank[rank][exp_id]:
-                    expert_to_rank[exp_id] = rank
-                    break
-
-        return global_tokens_distribution, expert_to_rank
+        return global_tokens_distribution, global_expert_sets
 
     def _compute_splits_for_set(
         self,
-        expert_ids: List[int],
+        set_idx: int,
+        global_expert_sets: List[List[List[int]]],
         global_tokens_distribution: torch.Tensor,
-        expert_to_rank: torch.Tensor,
     ) -> Tuple[List[int], List[int]]:
-        """Compute send_splits and recv_splits for a specific expert_set using DYNAMIC expert_to_rank.
+        """Compute send/recv splits for a specific set_idx using GLOBAL schedule.
 
-        send_splits[r] = number of tokens to SEND to EP rank r for this set
-        recv_splits[r] = number of tokens to RECV from EP rank r for this set
+        CRITICAL: Uses global_expert_sets to know EXACTLY which experts each rank
+        processes at this set_idx, enabling correct cross-rank communication.
+
+        send_splits[dest_rank] = tokens WE have that are routed to experts
+                                 in global_expert_sets[dest_rank][set_idx]
+
+        recv_splits[src_rank] = tokens src_rank has that are routed to experts
+                                in global_expert_sets[OUR_RANK][set_idx]
 
         Args:
-            expert_ids: List of expert IDs in this set
-            global_tokens_distribution: [ep_size, num_global_experts] token distribution
-            expert_to_rank: [num_global_experts] DYNAMIC mapping of expert -> rank
+            set_idx: Current set index
+            global_expert_sets: [ep_size][num_sets][experts] - complete schedule
+            global_tokens_distribution: [ep_size, num_global_experts] token counts
 
         Returns:
-            send_splits: List of tokens to send to each EP rank
-            recv_splits: List of tokens to receive from each EP rank
+            send_splits: List of token counts to send to each rank
+            recv_splits: List of token counts to receive from each rank
         """
         send_splits = []
         recv_splits = []
 
         for ep_rank in range(self.ep_size):
-            # SEND to ep_rank: tokens for experts in expert_ids that ep_rank processes
-            send_count = 0
-            for exp_id in expert_ids:
-                if expert_to_rank[exp_id].item() == ep_rank:
-                    send_count += global_tokens_distribution[self.ep_rank][exp_id].item()
+            # SEND to ep_rank: count tokens we have for experts that ep_rank processes
+            dest_experts = global_expert_sets[ep_rank][set_idx]
+            send_count = sum(
+                global_tokens_distribution[self.ep_rank][exp_id].item()
+                for exp_id in dest_experts
+            )
             send_splits.append(send_count)
 
-            # RECV from ep_rank: tokens for experts in expert_ids that WE process
-            recv_count = 0
-            for exp_id in expert_ids:
-                if expert_to_rank[exp_id].item() == self.ep_rank:
-                    recv_count += global_tokens_distribution[ep_rank][exp_id].item()
+            # RECV from ep_rank: count tokens ep_rank has for experts WE process
+            our_experts = global_expert_sets[self.ep_rank][set_idx]
+            recv_count = sum(
+                global_tokens_distribution[ep_rank][exp_id].item()
+                for exp_id in our_experts
+            )
             recv_splits.append(recv_count)
 
         return send_splits, recv_splits
 
-    def _build_send_buffer(
+    def _build_send_buffer_for_set(
         self,
         hidden_states: torch.Tensor,
         routing_map: torch.Tensor,
         probs: torch.Tensor,
+        set_idx: int,
+        global_expert_sets: List[List[List[int]]],
         global_tokens_distribution: torch.Tensor,
-        expert_to_rank: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int, int]]]:
-        """Build send buffer by permuting hidden_states according to destination EP rank using DYNAMIC expert_to_rank.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build send buffer for a specific set_idx.
 
-        This is the ONLY place we touch hidden_states before all_to_all.
+        CRITICAL: This method handles token-expert pairs, NOT unique tokens.
+        A token routed to multiple experts will appear multiple times in the buffer,
+        once for each expert it's routed to.
+
+        Extracts and packs tokens (and probs) destined for experts in
+        global_expert_sets[ep_rank][set_idx] for each destination rank.
 
         Args:
             hidden_states: [num_tokens, hidden_size] input tokens
             routing_map: [num_tokens, num_experts] boolean routing map
             probs: [num_tokens, num_experts] routing probabilities
-            global_tokens_distribution: [ep_size, num_global_experts] token distribution
-            expert_to_rank: [num_global_experts] DYNAMIC mapping of expert -> rank
+            set_idx: Current set index
+            global_expert_sets: [ep_size][num_sets][experts] - complete schedule
+            global_tokens_distribution: [ep_size, num_global_experts] token counts
 
         Returns:
-            send_buffer: [num_total_tokens, hidden_size] permuted hidden states
-            send_probs: [num_total_tokens] permuted probabilities
-            send_offsets: List of (offset, count) tuples for each EP rank
+            set_send_buffer: [total_send, hidden_size] packed hidden states (one per token-expert pair)
+            set_send_probs: [total_send] packed probabilities (one per token-expert pair)
+            set_send_reverse_indices: [total_send] original token indices for each entry
         """
         device = hidden_states.device
         dtype = hidden_states.dtype
-        num_tokens = hidden_states.size(0)
         hidden_size = hidden_states.size(1)
 
-        # Count total tokens to send (sum across all experts)
-        total_tokens = int(global_tokens_distribution[self.ep_rank].sum().item())
-
-        send_buffer = torch.empty(total_tokens, hidden_size, dtype=dtype, device=device)
-        send_probs = torch.empty(total_tokens, dtype=dtype, device=device)
-
-        send_offsets = []
-        current_offset = 0
-
-        # Permute by destination EP rank using DYNAMIC expert_to_rank
-        for ep_rank in range(self.ep_size):
-            # Build mask for tokens going to this EP rank
-            rank_mask = torch.zeros(num_tokens, dtype=torch.bool, device=device)
-            for exp_id in range(self.num_global_experts):
-                if expert_to_rank[exp_id].item() == ep_rank:
-                    rank_mask |= routing_map[:, exp_id]
-
-            rank_indices = rank_mask.nonzero(as_tuple=True)[0]
-            count = len(rank_indices)
-
-            if count > 0:
-                send_buffer[current_offset:current_offset + count] = hidden_states[rank_indices]
-
-                # Extract probs for these tokens (one prob per token-expert pair)
-                for i, token_idx in enumerate(rank_indices):
-                    # Find which expert this token is routed to that belongs to ep_rank
-                    for exp_id in range(self.num_global_experts):
-                        if routing_map[token_idx, exp_id] and expert_to_rank[exp_id].item() == ep_rank:
-                            send_probs[current_offset + i] = probs[token_idx, exp_id]
-                            break  # Each token goes to one expert in this rank
-
-            send_offsets.append((current_offset, count))
-            current_offset += count
-
-        return send_buffer, send_probs, send_offsets
-
-    def _extract_send_buffer_for_set(
-        self,
-        send_buffer: torch.Tensor,
-        send_probs: torch.Tensor,
-        expert_ids: List[int],
-        send_splits: List[int],
-        global_tokens_distribution: torch.Tensor,
-        expert_to_rank: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Extract the portion of send_buffer for a specific expert_set using DYNAMIC expert_to_rank.
-
-        Args:
-            send_buffer: Full send buffer
-            send_probs: Full send probs
-            expert_ids: Expert IDs in this set
-            send_splits: Send splits for this set
-            global_tokens_distribution: Global token distribution
-            expert_to_rank: [num_global_experts] DYNAMIC mapping of expert -> rank
-
-        Returns:
-            set_send_buffer: Send buffer for this set only
-            set_send_probs: Send probs for this set only
-        """
-        device = send_buffer.device
-        dtype = send_buffer.dtype
-        hidden_size = send_buffer.size(1)
-
+        # Compute splits first
+        send_splits, _ = self._compute_splits_for_set(
+            set_idx, global_expert_sets, global_tokens_distribution
+        )
         total_send = sum(send_splits)
+
         if total_send == 0:
             return (
                 torch.empty(0, hidden_size, dtype=dtype, device=device),
-                torch.empty(0, dtype=dtype, device=device)
+                torch.empty(0, dtype=dtype, device=device),
+                torch.empty(0, dtype=torch.long, device=device)
             )
 
+        # Allocate output buffers
         set_send_buffer = torch.empty(total_send, hidden_size, dtype=dtype, device=device)
         set_send_probs = torch.empty(total_send, dtype=dtype, device=device)
+        set_send_reverse_indices = torch.empty(total_send, dtype=torch.long, device=device)
 
-        # Build mapping from expert_id to position in send_buffer for each rank
-        current_set_offset = 0
-        for ep_rank in range(self.ep_size):
-            send_count = send_splits[ep_rank]
-            if send_count == 0:
-                continue
+        # Pack tokens per destination rank, iterating through each expert separately
+        # This correctly handles tokens routed to multiple experts (one entry per token-expert pair)
+        current_offset = 0
+        for dest_rank in range(self.ep_size):
+            dest_experts = global_expert_sets[dest_rank][set_idx]
 
-            # Find experts in this set that ep_rank processes (using DYNAMIC expert_to_rank)
-            set_experts_for_rank = [
-                exp_id for exp_id in expert_ids
-                if expert_to_rank[exp_id].item() == ep_rank
-            ]
+            # Iterate through each expert to correctly count token-expert pairs
+            for exp_id in dest_experts:
+                # Get tokens specifically for THIS expert
+                expert_mask = routing_map[:, exp_id]
+                expert_indices = expert_mask.nonzero(as_tuple=True)[0]
+                num_tokens_for_expert = len(expert_indices)
 
-            if not set_experts_for_rank:
-                continue
+                if num_tokens_for_expert > 0:
+                    # Copy hidden states for these tokens
+                    set_send_buffer[current_offset:current_offset + num_tokens_for_expert] = hidden_states[expert_indices]
+                    # Copy probs for these tokens to this specific expert
+                    set_send_probs[current_offset:current_offset + num_tokens_for_expert] = probs[expert_indices, exp_id]
+                    # Record original token indices for scatter after combine
+                    set_send_reverse_indices[current_offset:current_offset + num_tokens_for_expert] = expert_indices
 
-            # Find position in original send_buffer for this rank
-            rank_offset = 0
-            for prev_rank in range(ep_rank):
-                for exp_id in range(self.num_global_experts):
-                    if expert_to_rank[exp_id].item() == prev_rank:
-                        rank_offset += global_tokens_distribution[self.ep_rank][exp_id].item()
+                current_offset += num_tokens_for_expert
 
-            # Count tokens for set experts within this rank's section
-            set_token_count = 0
-            for exp_id in set_experts_for_rank:
-                set_token_count += global_tokens_distribution[self.ep_rank][exp_id].item()
-
-            if set_token_count > 0:
-                set_send_buffer[current_set_offset:current_set_offset + set_token_count] = \
-                    send_buffer[rank_offset:rank_offset + set_token_count]
-                set_send_probs[current_set_offset:current_set_offset + set_token_count] = \
-                    send_probs[rank_offset:rank_offset + set_token_count]
-                current_set_offset += set_token_count
-
-        return set_send_buffer, set_send_probs
-
-    def _scatter_gradients_to_original_order(
-        self,
-        grad_input_parts: List[torch.Tensor],
-        send_offsets: List[Tuple[int, int]],
-        hidden_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Scatter gradients back to original token order.
-
-        Since the all_to_all reverses the permutation, we need to map
-        gradients back to their original token positions.
-        """
-        # Sum all gradients to get total
-        total_grads = sum(g.size(0) for g in grad_input_parts) if grad_input_parts else 0
-
-        if total_grads == 0:
-            return torch.zeros(0, hidden_size, dtype=dtype, device=device)
-
-        # Simply concatenate - the order matches the original send order
-        grad_input = torch.cat(grad_input_parts, dim=0)
-        return grad_input
+        return set_send_buffer, set_send_probs, set_send_reverse_indices
 
     def forward(
         self,
@@ -2770,24 +2730,30 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
 
 
 class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
-    """Custom autograd function for fused dispatcher + expert compute with REAL all_to_all.
+    """Custom autograd function with UNCONDITIONAL all_to_all for deadlock-free pipeline.
 
-    CRITICAL: This implementation uses torch.distributed.all_to_all_single for
-    cross-rank token dispatch/combine, NOT local tensor slicing!
-
-    Key insight: all_to_all handles cross-rank communication, but we still need to:
-    1. Track which original token each dispatched token belongs to (reverse_indices)
-    2. Combine outputs back to original token positions using index_add_
+    CRITICAL DESIGN PRINCIPLE:
+    - The set_idx loop acts as a natural global barrier
+    - EVERY rank participates in EVERY all_to_all_single call
+    - NO conditional skips based on token counts
+    - NCCL correctly handles 0-size tensors and [0,0,...] splits
 
     Forward flow:
-    1. Phase 0: all_gather to get global token distribution (metadata only)
-    2. Build send_buffer once using _build_send_buffer helper
-    3. For each set: extract send portion -> all_to_all DISPATCH -> GEMM -> all_to_all COMBINE
-    4. Use index_add_ to combine outputs back to original token positions
+    1. Phase 0: Exchange global schedule + token distribution
+    2. For each set_idx:
+       - Build send buffer for this set's destination experts
+       - UNCONDITIONAL all_to_all DISPATCH (hidden + probs)
+       - Wait for load + comm streams
+       - Compute GEMM
+       - UNCONDITIONAL all_to_all COMBINE
+       - Scatter results back to original token positions
 
-    Backward flow:
-    1. For each set (reverse): reverse all_to_all for grad_fc2 -> recompute -> reverse all_to_all for grad_input
-    2. Scatter gradients back to original token order using reverse_indices
+    Backward flow (reverse order):
+    1. For each set_idx (reversed):
+       - UNCONDITIONAL reverse all_to_all for grad_fc2
+       - Recompute forward, compute gradients
+       - UNCONDITIONAL reverse all_to_all for grad_input
+       - Scatter gradients back to original positions
     """
 
     @staticmethod
@@ -2799,7 +2765,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         probs: torch.Tensor,
         expert_sets: List[List[int]],
     ):
-        """Forward pass with REAL all_to_all communication."""
+        """Forward pass with Prologue + Main Loop pipeline for proper overlap."""
         ctx.self = self
         ctx.expert_sets = expert_sets
         ctx.num_sets = len(expert_sets)
@@ -2811,241 +2777,239 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         ctx.hidden_size = hidden_size
         ctx.num_tokens = num_tokens
 
-        # ========== Phase 0: Metadata Exchange with DYNAMIC expert_to_rank ==========
-        # Single lightweight all_gather - NO hidden_states movement
-        global_tokens_distribution, expert_to_rank = self._phase0_exchange_metadata(routing_map, expert_sets)
+        # ========== Phase 0: Exchange Global Schedule + Token Distribution ==========
+        global_tokens_distribution, global_expert_sets = self._phase0_exchange_metadata(
+            routing_map, expert_sets
+        )
         ctx.global_tokens_distribution = global_tokens_distribution
-        ctx.expert_to_rank = expert_to_rank
+        ctx.global_expert_sets = global_expert_sets
 
-        # ========== Initialize events BEFORE loop to prevent deadlocks ==========
-        # BUG FIX: Must record events before waiting on them
+        # ========== Initialize events BEFORE loop ==========
         for i in range(2):
             self._compute_events[i].record(torch.cuda.current_stream())
             self._comm_events[i].record(self._comm_stream)
 
         # ========== Initialize output tensor ==========
-        # Output will be accumulated per token (weighted sum of expert outputs)
         output = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
 
-        # ========== Build send_buffer ONCE using helper with DYNAMIC expert_to_rank ==========
-        # This permutes hidden_states by destination EP rank
-        send_buffer, send_probs, send_offsets = self._build_send_buffer(
-            hidden_states, routing_map, probs, global_tokens_distribution, expert_to_rank
-        )
-        ctx.send_offsets = send_offsets
-
-        # ========== Prepare per-set data including reverse_indices ==========
-        # We need to track which original token each dispatched token belongs to
-        set_data_list = []
-        for set_idx, expert_ids in enumerate(expert_sets):
-            set_hidden_list = []
-            set_probs_list = []
-            set_reverse_indices = []
-
-            for exp_id in expert_ids:
-                expert_mask = routing_map[:, exp_id].nonzero(as_tuple=True)[0]
-                if len(expert_mask) > 0:
-                    expert_probs = probs[expert_mask, exp_id]
-                    expert_hidden = hidden_states[expert_mask]
-                    set_probs_list.append(expert_probs)
-                    set_hidden_list.append(expert_hidden)
-                    set_reverse_indices.append(expert_mask)
-
-            if set_hidden_list:
-                set_hidden = torch.cat(set_hidden_list, dim=0)
-                set_probs = torch.cat(set_probs_list, dim=0)
-                set_reverse = torch.cat(set_reverse_indices, dim=0)
-            else:
-                set_hidden = torch.empty(0, hidden_size, dtype=dtype, device=device)
-                set_probs = torch.empty(0, dtype=dtype, device=device)
-                set_reverse = torch.empty(0, dtype=torch.long, device=device)
-
-            set_data_list.append((set_hidden, set_probs, set_reverse))
-
-        # ========== Main Pipeline Loop ==========
-        # Save only dispatched tokens per set (NOT full hidden_states!)
+        # ========== Initialize data lists ==========
         dispatched_tokens_list = []
         dispatched_probs_list = []
         reverse_indices_list = []
-        recv_splits_list = []
         send_splits_list = []
+        recv_splits_list = []
+        tokens_per_expert_per_set = []
 
         current_buffer = 0
+        next_buffer = 1
 
         nvtx.range_push("FusedDispatcher::forward")
 
-        for set_idx, expert_ids in enumerate(expert_sets):
-            if len(expert_ids) == 0:
-                recv_splits_list.append([0] * self.ep_size)
-                send_splits_list.append([0] * self.ep_size)
-                continue
+        # ==================== Prologue: Prepare Set 0 ====================
+        if len(expert_sets) > 0:
+            set_0_experts = global_expert_sets[self.ep_rank][0]
 
-            # Get pre-computed set data (including reverse_indices for output combining)
-            set_hidden_states, set_probs, set_reverse_indices = set_data_list[set_idx]
-            num_set_tokens = set_hidden_states.size(0)
+            # Async load Set 0 weights to current_buffer
+            self._prefetch_expert_weights_async(set_0_experts, current_buffer)
 
-            if num_set_tokens == 0:
-                recv_splits_list.append([0] * self.ep_size)
-                send_splits_list.append([0] * self.ep_size)
-                continue
-
-            # Compute splits using helper with DYNAMIC expert_to_rank
-            send_splits, recv_splits = self._compute_splits_for_set(
-                expert_ids, global_tokens_distribution, expert_to_rank
+            # Prepare Set 0 splits and buffers
+            send_splits_0, recv_splits_0 = self._compute_splits_for_set(
+                0, global_expert_sets, global_tokens_distribution
             )
-            recv_splits_list.append(recv_splits)
-            send_splits_list.append(send_splits)
+            send_splits_list.append(send_splits_0)
+            recv_splits_list.append(recv_splits_0)
 
-            total_recv = sum(recv_splits)
-            total_send = sum(send_splits)
+            total_send_0 = sum(send_splits_0)
+            total_recv_0 = sum(recv_splits_0)
 
-            # Extract set-specific send buffer using helper with DYNAMIC expert_to_rank
-            set_send_buffer, set_send_probs = self._extract_send_buffer_for_set(
-                send_buffer, send_probs, expert_ids, send_splits, global_tokens_distribution, expert_to_rank
-            )
+            set_send_buffer_0, set_send_probs_0, set_send_reverse_indices_0 = \
+                self._build_send_buffer_for_set(
+                    hidden_states, routing_map, probs,
+                    0, global_expert_sets, global_tokens_distribution
+                )
 
-            # Allocate recv buffer
-            set_recv_buffer = torch.empty(total_recv, hidden_size, dtype=dtype, device=device) if total_recv > 0 else \
-                torch.empty(0, hidden_size, dtype=dtype, device=device)
+            # Allocate recv buffers for Set 0
+            set_recv_buffer_0 = torch.empty(total_recv_0, hidden_size, dtype=dtype, device=device)
+            recv_probs_buffer_0 = torch.empty(total_recv_0, dtype=dtype, device=device)
 
-            # Allocate recv_probs_buffer for RECEIVED probabilities
-            recv_probs_buffer = torch.empty(total_recv, dtype=dtype, device=device) if total_recv > 0 else \
-                torch.empty(0, dtype=dtype, device=device)
-
-            # ========== Step A: DISPATCH on _comm_stream using REAL all_to_all_single ==========
-            # This sends tokens AND probs TO the rank that processes them
-            if self.ep_size > 1 and total_recv > 0 and total_send > 0:
+            # Launch Set 0 Dispatch on _comm_stream
+            if self.ep_size > 1:
                 with torch.cuda.stream(self._comm_stream):
                     self._compute_events[current_buffer].wait(self._comm_stream)
-                    # Dispatch hidden states
                     torch.distributed.all_to_all_single(
-                        set_recv_buffer,
-                        set_send_buffer,
-                        output_split_sizes=recv_splits,
-                        input_split_sizes=send_splits,
+                        set_recv_buffer_0, set_send_buffer_0,
+                        output_split_sizes=recv_splits_0,
+                        input_split_sizes=send_splits_0,
                         group=self.ep_group
                     )
-                    # Dispatch probs (SAME splits as hidden states!)
                     torch.distributed.all_to_all_single(
-                        recv_probs_buffer,
-                        set_send_probs,
-                        output_split_sizes=recv_splits,
-                        input_split_sizes=send_splits,
+                        recv_probs_buffer_0, set_send_probs_0,
+                        output_split_sizes=recv_splits_0,
+                        input_split_sizes=send_splits_0,
                         group=self.ep_group
                     )
                     self._comm_events[current_buffer].record(self._comm_stream)
-            elif self.ep_size == 1:
-                # Single rank: use local slicing for the recv_buffer
-                set_recv_buffer = set_hidden_states
-                recv_probs_buffer = set_probs  # Use local probs
 
-            # Prefetch weights on _load_stream
-            self._prefetch_expert_weights_async(expert_ids, current_buffer)
+            # Store Set 0 data as "current" for the first loop iteration
+            current_send_buffer = set_send_buffer_0
+            current_send_probs = set_send_probs_0
+            current_send_reverse_indices = set_send_reverse_indices_0
+            current_recv_buffer = set_recv_buffer_0
+            current_recv_probs = recv_probs_buffer_0
+            current_send_splits = send_splits_0
+            current_recv_splits = recv_splits_0
+            current_total_send = total_send_0
+            current_total_recv = total_recv_0
 
-            # Sync - wait for BOTH streams
+        # ==================== Main Loop ====================
+        for set_idx in range(len(expert_sets)):
+            # Get experts for current set
+            local_experts = global_expert_sets[self.ep_rank][set_idx]
+
+            # Wait for current buffer to be ready (load + comm from prologue or previous iteration)
+            torch.cuda.current_stream().wait_stream(self._load_stream)
             if self.ep_size > 1:
                 torch.cuda.current_stream().wait_stream(self._comm_stream)
-            torch.cuda.current_stream().wait_stream(self._load_stream)
 
-            # ========== Step B: Compute GEMM ==========
-            w1_gpu = self._w1_gpu_workspace[current_buffer, :len(expert_ids)]
-            w2_gpu = self._w2_gpu_workspace[current_buffer, :len(expert_ids)]
+            # ==================== ASYNC: Prepare Next Set (N+1) ====================
+            next_set_idx = set_idx + 1
+            if next_set_idx < len(expert_sets):
+                next_experts = global_expert_sets[self.ep_rank][next_set_idx]
+
+                # 1. Prefetch N+1 weights to next_buffer
+                self._prefetch_expert_weights_async(next_experts, next_buffer)
+
+                # 2. Prepare N+1 splits and buffers
+                send_splits_next, recv_splits_next = self._compute_splits_for_set(
+                    next_set_idx, global_expert_sets, global_tokens_distribution
+                )
+                send_splits_list.append(send_splits_next)
+                recv_splits_list.append(recv_splits_next)
+
+                total_send_next = sum(send_splits_next)
+                total_recv_next = sum(recv_splits_next)
+
+                set_send_buffer_next, set_send_probs_next, set_send_reverse_indices_next = \
+                    self._build_send_buffer_for_set(
+                        hidden_states, routing_map, probs,
+                        next_set_idx, global_expert_sets, global_tokens_distribution
+                    )
+
+                # Allocate recv buffers for N+1
+                set_recv_buffer_next = torch.empty(total_recv_next, hidden_size, dtype=dtype, device=device)
+                recv_probs_buffer_next = torch.empty(total_recv_next, dtype=dtype, device=device)
+
+                # 3. Launch N+1 Dispatch on _comm_stream
+                if self.ep_size > 1:
+                    with torch.cuda.stream(self._comm_stream):
+                        # CRITICAL: Wait for next_buffer to be free (previous iteration finished)
+                        self._compute_events[next_buffer].wait(self._comm_stream)
+                        torch.distributed.all_to_all_single(
+                            set_recv_buffer_next, set_send_buffer_next,
+                            output_split_sizes=recv_splits_next,
+                            input_split_sizes=send_splits_next,
+                            group=self.ep_group
+                        )
+                        torch.distributed.all_to_all_single(
+                            recv_probs_buffer_next, set_send_probs_next,
+                            output_split_sizes=recv_splits_next,
+                            input_split_sizes=send_splits_next,
+                            group=self.ep_group
+                        )
+                        self._comm_events[next_buffer].record(self._comm_stream)
+
+            # ==================== Compute Current Set (N) ====================
+            num_local_experts = len(local_experts)
+            w1_gpu = self._w1_gpu_workspace[current_buffer, :num_local_experts]
+            w2_gpu = self._w2_gpu_workspace[current_buffer, :num_local_experts]
 
             # Compute tokens_per_expert for GEMM
             tokens_per_expert_list = []
-            for exp_id in expert_ids:
+            for exp_id in local_experts:
                 count = routing_map[:, exp_id].sum().item()
                 tokens_per_expert_list.append(count)
             tokens_per_expert = torch.tensor(tokens_per_expert_list, dtype=torch.long)
+            tokens_per_expert_per_set.append(tokens_per_expert)
 
-            fc2_output = None
-            if total_recv > 0:
-                # GroupedGEMM: fc1
+            if current_total_recv > 0 and num_local_experts > 0:
                 fc1_output = gg.ops.gmm(
-                    set_recv_buffer, w1_gpu, tokens_per_expert, trans_b=False
+                    current_recv_buffer, w1_gpu, tokens_per_expert, trans_b=False
                 )
-
-                # Activation with RECEIVED probs (NOT local probs!)
-                intermediate = self.activation_func(fc1_output) * recv_probs_buffer.unsqueeze(-1)
-
-                # GroupedGEMM: fc2
+                intermediate = self.activation_func(fc1_output) * current_recv_probs.unsqueeze(-1)
                 fc2_output = gg.ops.gmm(
                     intermediate, w2_gpu, tokens_per_expert, trans_b=False
                 )
             else:
                 fc2_output = torch.empty(0, hidden_size, dtype=dtype, device=device)
 
-            # Record compute completion
+            # Record compute completion (protects next_buffer from being overwritten)
             self._compute_events[current_buffer].record(torch.cuda.current_stream())
 
-            # ========== Step C: COMBINE on _comm_stream (send fc2_output back to origin ranks) ==========
-            # This sends results BACK to the rank that originally had the tokens
-            # CRITICAL: Split order is REVERSED from dispatch!
-            set_combine_buffer = torch.empty(total_send, hidden_size, dtype=dtype, device=device)
-            if self.ep_size > 1 and total_recv > 0 and total_send > 0:
+            # ==================== Combine Current Set (N) ====================
+            set_combine_buffer = torch.empty(current_total_send, hidden_size, dtype=dtype, device=device)
+            if self.ep_size > 1:
                 with torch.cuda.stream(self._comm_stream):
                     self._compute_events[current_buffer].wait(self._comm_stream)
                     torch.distributed.all_to_all_single(
-                        set_combine_buffer,
-                        fc2_output,
-                        output_split_sizes=send_splits,  # REVERSED from dispatch!
-                        input_split_sizes=recv_splits,
+                        set_combine_buffer, fc2_output,
+                        output_split_sizes=current_send_splits,  # REVERSED!
+                        input_split_sizes=current_recv_splits,
                         group=self.ep_group
                     )
                     self._comm_events[current_buffer].record(self._comm_stream)
-
-                # Wait for combine to finish
                 torch.cuda.current_stream().wait_stream(self._comm_stream)
-            elif self.ep_size == 1:
-                # Single rank: fc2_output is already in correct order
+            else:
                 set_combine_buffer = fc2_output
 
-            # ========== Step D: Scatter combine_buffer back to original token positions ==========
-            if set_reverse_indices.numel() > 0:
-                output.index_add_(0, set_reverse_indices.to(device), set_combine_buffer)
+            # ==================== Scatter Results ====================
+            if current_send_reverse_indices.numel() > 0 and set_combine_buffer.numel() > 0:
+                output.index_add_(0, current_send_reverse_indices, set_combine_buffer)
 
-            # Save for backward (only dispatched tokens, NOT full hidden_states!)
-            # IMPORTANT: Save recv_probs_buffer (the probs actually used in forward), NOT set_probs!
-            dispatched_tokens_list.append(set_recv_buffer.detach())
-            dispatched_probs_list.append(recv_probs_buffer.detach())
-            reverse_indices_list.append(set_reverse_indices.detach())
+            # Save for backward
+            dispatched_tokens_list.append(current_recv_buffer.detach())
+            dispatched_probs_list.append(current_recv_probs.detach())
+            reverse_indices_list.append(current_send_reverse_indices.detach())
 
-            # Swap buffers
-            current_buffer = 1 - current_buffer
+            # ==================== Swap Buffers for Next Iteration ====================
+            current_buffer, next_buffer = next_buffer, current_buffer
+
+            # Update current buffers to point to next set's precomputed data
+            if next_set_idx < len(expert_sets):
+                current_send_buffer = set_send_buffer_next
+                current_send_probs = set_send_probs_next
+                current_send_reverse_indices = set_send_reverse_indices_next
+                current_recv_buffer = set_recv_buffer_next
+                current_recv_probs = recv_probs_buffer_next
+                current_send_splits = send_splits_next
+                current_recv_splits = recv_splits_next
+                current_total_send = total_send_next
+                current_total_recv = total_recv_next
 
         nvtx.range_pop()
 
         # Save for backward
         ctx.save_for_backward(*dispatched_tokens_list, *dispatched_probs_list, *reverse_indices_list)
-        ctx.recv_splits_list = recv_splits_list
         ctx.send_splits_list = send_splits_list
-        ctx.tokens_per_expert_per_set = [
-            torch.tensor(
-                [routing_map[:, exp_id].sum().item() for exp_id in expert_ids],
-                dtype=torch.long
-            ) for expert_ids in expert_sets
-        ]
+        ctx.recv_splits_list = recv_splits_list
+        ctx.tokens_per_expert_per_set = tokens_per_expert_per_set
 
         return output, None
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, grad_bias):
-        """Backward pass with REAL all_to_all_single for gradient communication.
-
-        CRITICAL: This uses all_to_all_single to send gradients back to original ranks
-        for multi-rank case, but still needs index_add_ for proper gradient scattering.
-        """
-        del grad_bias  # Unused
+        """Backward pass with Prologue + Main Loop pipeline for proper overlap."""
+        del grad_bias
 
         self: 'FusedDispatcherCacheGroupedMLP' = ctx.self
         expert_sets: List[List[int]] = ctx.expert_sets
-        recv_splits_list = ctx.recv_splits_list
+        global_expert_sets: List[List[List[int]]] = ctx.global_expert_sets
         send_splits_list = ctx.send_splits_list
+        recv_splits_list = ctx.recv_splits_list
         tokens_per_expert_per_set = ctx.tokens_per_expert_per_set
         hidden_size = ctx.hidden_size
         num_tokens = ctx.num_tokens
 
-        # Retrieve saved tensors (dispatched tokens, probs, reverse_indices)
+        # Retrieve saved tensors
         num_sets = ctx.num_sets
         dispatched_tensors = ctx.saved_tensors[:num_sets]
         dispatched_probs = ctx.saved_tensors[num_sets:2*num_sets]
@@ -3054,8 +3018,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         device = grad_output.device
         dtype = grad_output.dtype
 
-        # ========== Initialize events BEFORE loop to prevent deadlocks ==========
-        # BUG FIX: Must record events before waiting on them
+        # Initialize events
         for i in range(2):
             self._compute_events[i].record(torch.cuda.current_stream())
             self._comm_events[i].record(self._comm_stream)
@@ -3064,117 +3027,185 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         grad_input = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
 
         current_buffer = 0
+        next_buffer = 1
 
         nvtx.range_push("FusedDispatcher::backward")
 
-        # Backward in reverse order
-        for set_idx in range(len(expert_sets) - 1, -1, -1):
-            expert_ids = expert_sets[set_idx]
-            if len(expert_ids) == 0:
-                continue
+        # ==================== Prologue: Prepare Last Set (len-1) ====================
+        last_set_idx = len(expert_sets) - 1
+        if last_set_idx >= 0:
+            last_experts = global_expert_sets[self.ep_rank][last_set_idx]
 
-            dispatched_tokens = dispatched_tensors[set_idx]
-            dispatched_probs_t = dispatched_probs[set_idx]
-            reverse_indices = reverse_indices_list[set_idx]
-            tokens_per_expert = tokens_per_expert_per_set[set_idx]
-            recv_splits = recv_splits_list[set_idx] if set_idx < len(recv_splits_list) else []
-            send_splits = send_splits_list[set_idx] if set_idx < len(send_splits_list) else []
+            # Async load last set weights to current_buffer
+            self._prefetch_expert_weights_async(last_experts, current_buffer)
 
-            num_set_tokens = dispatched_tokens.size(0)
-            if num_set_tokens == 0:
-                continue
+            # Get saved data for last set
+            current_dispatched_tokens = dispatched_tensors[last_set_idx]
+            current_dispatched_probs = dispatched_probs[last_set_idx]
+            current_reverse_indices = reverse_indices_list[last_set_idx]
+            current_tokens_per_expert = tokens_per_expert_per_set[last_set_idx]
+            current_send_splits = send_splits_list[last_set_idx]
+            current_recv_splits = recv_splits_list[last_set_idx]
+            current_total_send = sum(current_send_splits)
+            current_total_recv = sum(current_recv_splits)
 
-            total_recv = sum(recv_splits) if recv_splits else 0
-            total_send = sum(send_splits) if send_splits else 0
+            # Get grad_output for last set's tokens
+            current_set_grad_output = grad_output[current_reverse_indices.to(device)] if current_reverse_indices.numel() > 0 else \
+                torch.empty(0, hidden_size, dtype=dtype, device=device)
 
-            # Prefetch weights for this set
-            self._prefetch_expert_weights_async(expert_ids, current_buffer)
-
-            # Wait for weight load
-            torch.cuda.current_stream().wait_stream(self._load_stream)
-
-            # Get weights
-            w1_gpu = self._w1_gpu_workspace[current_buffer, :len(expert_ids)]
-            w2_gpu = self._w2_gpu_workspace[current_buffer, :len(expert_ids)]
-
-            # Get grad_output for these tokens using reverse_indices
-            set_grad_output = grad_output[reverse_indices.to(device)]
-
-            # REVERSE COMBINE: We must send the gathered gradients back to the expert nodes.
-            # This converts set_grad_output (size: total_send) back to grad_fc2 (size: total_recv).
-            if self.ep_size > 1 and total_recv > 0 and total_send > 0:
-                grad_fc2 = torch.empty(total_recv, hidden_size, dtype=dtype, device=device)
+            # Launch last set's REVERSE COMBINE on _comm_stream
+            current_grad_fc2 = torch.empty(current_total_recv, hidden_size, dtype=dtype, device=device)
+            if self.ep_size > 1:
                 with torch.cuda.stream(self._comm_stream):
                     torch.distributed.all_to_all_single(
-                        grad_fc2,
-                        set_grad_output,
-                        output_split_sizes=recv_splits,  # REVERSED from Forward Combine!
-                        input_split_sizes=send_splits,
+                        current_grad_fc2, current_set_grad_output,
+                        output_split_sizes=current_recv_splits,
+                        input_split_sizes=current_send_splits,
                         group=self.ep_group
                     )
-                # The compute stream must wait for the gradients to arrive before computing GEMM backward
+                    self._comm_events[current_buffer].record(self._comm_stream)
+
+        # ==================== Main Loop (REVERSE order) ====================
+        for set_idx in range(last_set_idx, -1, -1):
+            local_experts = global_expert_sets[self.ep_rank][set_idx]
+
+            # Wait for current buffer to be ready
+            torch.cuda.current_stream().wait_stream(self._load_stream)
+            if self.ep_size > 1:
                 torch.cuda.current_stream().wait_stream(self._comm_stream)
+
+            # ==================== ASYNC: Prepare Previous Set (set_idx-1) ====================
+            prev_set_idx = set_idx - 1
+            if prev_set_idx >= 0:
+                prev_experts = global_expert_sets[self.ep_rank][prev_set_idx]
+
+                # 1. Prefetch prev set weights to next_buffer
+                self._prefetch_expert_weights_async(prev_experts, next_buffer)
+
+                # 2. Get saved data for prev set
+                prev_dispatched_tokens = dispatched_tensors[prev_set_idx]
+                prev_dispatched_probs = dispatched_probs[prev_set_idx]
+                prev_reverse_indices = reverse_indices_list[prev_set_idx]
+                prev_tokens_per_expert = tokens_per_expert_per_set[prev_set_idx]
+                prev_send_splits = send_splits_list[prev_set_idx]
+                prev_recv_splits = recv_splits_list[prev_set_idx]
+                prev_total_send = sum(prev_send_splits)
+                prev_total_recv = sum(prev_recv_splits)
+
+                # 3. Get grad_output for prev set's tokens
+                prev_set_grad_output = grad_output[prev_reverse_indices.to(device)] if prev_reverse_indices.numel() > 0 else \
+                    torch.empty(0, hidden_size, dtype=dtype, device=device)
+
+                # 4. Launch prev set's REVERSE COMBINE on _comm_stream
+                prev_grad_fc2 = torch.empty(prev_total_recv, hidden_size, dtype=dtype, device=device)
+                if self.ep_size > 1:
+                    with torch.cuda.stream(self._comm_stream):
+                        # CRITICAL: Wait for next_buffer to be free
+                        self._compute_events[next_buffer].wait(self._comm_stream)
+                        torch.distributed.all_to_all_single(
+                            prev_grad_fc2, prev_set_grad_output,
+                            output_split_sizes=prev_recv_splits,
+                            input_split_sizes=prev_send_splits,
+                            group=self.ep_group
+                        )
+                        self._comm_events[next_buffer].record(self._comm_stream)
+
+            # ==================== Compute Current Set ====================
+            num_local_experts = len(local_experts)
+            w1_gpu = self._w1_gpu_workspace[current_buffer, :num_local_experts]
+            w2_gpu = self._w2_gpu_workspace[current_buffer, :num_local_experts]
+
+            # Use current set's data (from prologue or previous iteration)
+            if set_idx == last_set_idx:
+                dispatched_tokens = current_dispatched_tokens
+                dispatched_probs_t = current_dispatched_probs
+                tokens_per_expert = current_tokens_per_expert
+                grad_fc2 = current_grad_fc2
+                total_send = current_total_send
+                total_recv = current_total_recv
+                send_splits = current_send_splits
+                recv_splits = current_recv_splits
+                set_reverse_indices = current_reverse_indices
             else:
-                # Single rank: no communication needed
-                grad_fc2 = set_grad_output
+                dispatched_tokens = dispatched_tensors[set_idx]
+                dispatched_probs_t = dispatched_probs[set_idx]
+                tokens_per_expert = tokens_per_expert_per_set[set_idx]
+                grad_fc2 = current_grad_fc2
+                total_send = current_total_send
+                total_recv = current_total_recv
+                send_splits = current_send_splits
+                recv_splits = current_recv_splits
+                set_reverse_indices = current_reverse_indices
 
-            # Recompute forward with enable_grad to get gradients
-            with torch.enable_grad():
-                dispatched_tokens_req = dispatched_tokens.detach().requires_grad_(True)
-                w1_gpu_req = w1_gpu.detach().requires_grad_(True)
-                w2_gpu_req = w2_gpu.detach().requires_grad_(True)
-                probs_req = dispatched_probs_t.detach().requires_grad_(True)
+            # Recompute forward with enable_grad
+            if total_recv > 0 and num_local_experts > 0:
+                with torch.enable_grad():
+                    dispatched_tokens_req = dispatched_tokens.detach().requires_grad_(True)
+                    w1_gpu_req = w1_gpu.detach().requires_grad_(True)
+                    w2_gpu_req = w2_gpu.detach().requires_grad_(True)
+                    probs_req = dispatched_probs_t.detach().requires_grad_(True)
 
-                fc1 = gg.ops.gmm(dispatched_tokens_req, w1_gpu_req, tokens_per_expert, trans_b=False)
-                intermediate = self.activation_func(fc1) * probs_req.unsqueeze(-1)
-                fc2 = gg.ops.gmm(intermediate, w2_gpu_req, tokens_per_expert, trans_b=False)
+                    fc1 = gg.ops.gmm(dispatched_tokens_req, w1_gpu_req, tokens_per_expert, trans_b=False)
+                    intermediate = self.activation_func(fc1) * probs_req.unsqueeze(-1)
+                    fc2 = gg.ops.gmm(intermediate, w2_gpu_req, tokens_per_expert, trans_b=False)
 
-                grads = torch.autograd.grad(
-                    fc2, (dispatched_tokens_req, w1_gpu_req, w2_gpu_req, probs_req),
-                    grad_outputs=grad_fc2,
-                    retain_graph=False,
-                    create_graph=False,
-                    allow_unused=True,
-                )
+                    grads = torch.autograd.grad(
+                        fc2, (dispatched_tokens_req, w1_gpu_req, w2_gpu_req, probs_req),
+                        grad_outputs=grad_fc2,
+                        retain_graph=False,
+                        create_graph=False,
+                        allow_unused=True,
+                    )
 
-                grad_input_local = grads[0] if grads[0] is not None else torch.zeros_like(dispatched_tokens)
-                grad_w1 = grads[1]
-                grad_w2 = grads[2]
+                    grad_input_local = grads[0] if grads[0] is not None else torch.zeros_like(dispatched_tokens)
+                    grad_w1 = grads[1]
+                    grad_w2 = grads[2]
+            else:
+                grad_input_local = torch.empty(0, hidden_size, dtype=dtype, device=device)
+                grad_w1 = None
+                grad_w2 = None
 
             # Offload weight gradients
             if grad_w1 is not None and grad_w2 is not None:
-                self._offload_grads_to_cpu(expert_ids, grad_w1, grad_w2)
-
-            # REVERSE DISPATCH: Send grad_input_local back to originating ranks
-            # This is the ONLY all_to_all needed in backward
-            if self.ep_size > 1 and total_send > 0 and total_recv > 0:
-                grad_input_remote = torch.empty(total_send, hidden_size, dtype=dtype, device=device)
-                with torch.cuda.stream(self._comm_stream):
-                    torch.distributed.all_to_all_single(
-                        grad_input_remote,
-                        grad_input_local,
-                        output_split_sizes=send_splits,  # REVERSED from forward dispatch!
-                        input_split_sizes=recv_splits,
-                        group=self.ep_group
-                    )
-                self._comm_events[current_buffer].record(self._comm_stream)
-                torch.cuda.current_stream().wait_stream(self._comm_stream)
-                # Use index_add_ to scatter gradients back to original token positions
-                if reverse_indices.numel() > 0:
-                    grad_input.index_add_(0, reverse_indices.to(device), grad_input_remote)
-            else:
-                # Single rank: use index_add_ to scatter gradients back to original token positions
-                if reverse_indices.numel() > 0:
-                    grad_input.index_add_(0, reverse_indices.to(device), grad_input_local)
-
-            # Immediately delete local buffer - NO accumulation!
-            del grad_input_local
+                self._offload_grads_to_cpu(local_experts, grad_w1, grad_w2)
 
             # Record compute completion
             self._compute_events[current_buffer].record(torch.cuda.current_stream())
 
-            # Swap buffers
-            current_buffer = 1 - current_buffer
+            # ==================== REVERSE DISPATCH ====================
+            grad_input_remote = torch.empty(total_send, hidden_size, dtype=dtype, device=device)
+            if self.ep_size > 1:
+                with torch.cuda.stream(self._comm_stream):
+                    self._compute_events[current_buffer].wait(self._comm_stream)
+                    torch.distributed.all_to_all_single(
+                        grad_input_remote, grad_input_local,
+                        output_split_sizes=send_splits,
+                        input_split_sizes=recv_splits,
+                        group=self.ep_group
+                    )
+                    self._comm_events[current_buffer].record(self._comm_stream)
+                torch.cuda.current_stream().wait_stream(self._comm_stream)
+            else:
+                grad_input_remote = grad_input_local
+
+            # Scatter gradients back to original token positions
+            if set_reverse_indices.numel() > 0 and grad_input_remote.numel() > 0:
+                grad_input.index_add_(0, set_reverse_indices.to(device), grad_input_remote)
+
+            # ==================== Swap Buffers ====================
+            current_buffer, next_buffer = next_buffer, current_buffer
+
+            # Update current data to prev set's precomputed data
+            if prev_set_idx >= 0:
+                current_dispatched_tokens = prev_dispatched_tokens
+                current_dispatched_probs = prev_dispatched_probs
+                current_reverse_indices = prev_reverse_indices
+                current_tokens_per_expert = prev_tokens_per_expert
+                current_send_splits = prev_send_splits
+                current_recv_splits = prev_recv_splits
+                current_total_send = prev_total_send
+                current_total_recv = prev_total_recv
+                current_grad_fc2 = prev_grad_fc2
 
         nvtx.range_pop()
 
