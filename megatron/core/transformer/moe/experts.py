@@ -2849,6 +2849,10 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                         group=self.ep_group
                     )
                     self._comm_events[current_buffer].record(self._comm_stream)
+            else:
+                # EP=1: No cross-rank communication, just use send buffers directly
+                set_recv_buffer_0 = set_send_buffer_0
+                recv_probs_buffer_0 = set_send_probs_0
 
             # Store Set 0 data as "current" for the first loop iteration
             current_send_buffer = set_send_buffer_0
@@ -2917,6 +2921,10 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                             group=self.ep_group
                         )
                         self._comm_events[next_buffer].record(self._comm_stream)
+                else:
+                    # EP=1: No cross-rank communication, just use send buffers directly
+                    set_recv_buffer_next = set_send_buffer_next
+                    recv_probs_buffer_next = set_send_probs_next
 
             # ==================== Compute Current Set (N) ====================
             num_local_experts = len(local_experts)
@@ -3064,6 +3072,9 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                         group=self.ep_group
                     )
                     self._comm_events[current_buffer].record(self._comm_stream)
+            else:
+                # EP=1: No cross-rank communication, use grad_output directly
+                current_grad_fc2 = current_set_grad_output
 
         # ==================== Main Loop (REVERSE order) ====================
         for set_idx in range(last_set_idx, -1, -1):
@@ -3109,6 +3120,9 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                             group=self.ep_group
                         )
                         self._comm_events[next_buffer].record(self._comm_stream)
+                else:
+                    # EP=1: No cross-rank communication, use grad_output directly
+                    prev_grad_fc2 = prev_set_grad_output
 
             # ==================== Compute Current Set ====================
             num_local_experts = len(local_experts)
