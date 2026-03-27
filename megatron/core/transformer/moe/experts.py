@@ -2479,6 +2479,39 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
         self._compute_events = [torch.cuda.Event() for _ in range(2)]
         self._load_events = [torch.cuda.Event() for _ in range(2)]
 
+    def _prefetch_expert_weights_async(
+        self,
+        expert_ids: List[int],
+        buffer_idx: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Override parent to use self._compute_events for correct sync.
+
+        CRITICAL FIX: The parent class CacheGroupedMLP._prefetch_expert_weights_async
+        waits on _global_buffer_manager.compute_events, but we record completion on
+        self._compute_events. These are different event objects, causing the wait
+        to have no effect. This override uses the correct event object.
+
+        Args:
+            expert_ids: List of expert IDs to load
+            buffer_idx: Buffer index (0 or 1) for double buffering
+
+        Returns:
+            Tuple of (w1_gpu, w2_gpu) - views into GPU workspace
+        """
+        num_experts = len(expert_ids)
+        w1_gpu = self._w1_gpu_workspace[buffer_idx, :num_experts]
+        w2_gpu = self._w2_gpu_workspace[buffer_idx, :num_experts]
+
+        # CRITICAL: Use self._compute_events, not _global_buffer_manager.compute_events
+        self._compute_events[buffer_idx].wait(self._load_stream)
+
+        with torch.cuda.stream(self._load_stream):
+            for i, exp_id in enumerate(expert_ids):
+                w1_gpu[i].copy_(self.weight1.data[exp_id], non_blocking=True)
+                w2_gpu[i].copy_(self.weight2.data[exp_id], non_blocking=True)
+
+        return w1_gpu, w2_gpu
+
     def _phase0_exchange_metadata(
         self,
         routing_map: torch.Tensor,
@@ -2778,6 +2811,14 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         ctx.num_tokens = num_tokens
 
         # ========== Phase 0: Exchange Global Schedule + Token Distribution ==========
+        '''
+        global_tokens_distribution: [ep_size, num_global_experts] tensor on CPU
+                global_tokens_distribution[ep_rank][expert_id] = number of tokens
+                from ep_rank that are routed to expert_id
+            global_expert_sets: [ep_size][num_sets][experts] - COMPLETE schedule
+                global_expert_sets[ep_rank][set_idx] = list of expert IDs
+                that ep_rank will process at set_idx
+        '''
         global_tokens_distribution, global_expert_sets = self._phase0_exchange_metadata(
             routing_map, expert_sets
         )
@@ -2812,7 +2853,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             # Async load Set 0 weights to current_buffer
             self._prefetch_expert_weights_async(set_0_experts, current_buffer)
 
-            # Prepare Set 0 splits and buffers
+            # Prepare Set 0 splits and buffers, 获得其余rank发送/接收到本rank的数量数组
             send_splits_0, recv_splits_0 = self._compute_splits_for_set(
                 0, global_expert_sets, global_tokens_distribution
             )
@@ -2821,7 +2862,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
             total_send_0 = sum(send_splits_0)
             total_recv_0 = sum(recv_splits_0)
-
+            # 构建发送buffer，按照发送的rank排布，以及原始的id，用于combine
             set_send_buffer_0, set_send_probs_0, set_send_reverse_indices_0 = \
                 self._build_send_buffer_for_set(
                     hidden_states, routing_map, probs,
@@ -2931,13 +2972,46 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             w1_gpu = self._w1_gpu_workspace[current_buffer, :num_local_experts]
             w2_gpu = self._w2_gpu_workspace[current_buffer, :num_local_experts]
 
-            # Compute tokens_per_expert for GEMM
+            # Compute tokens_per_expert for GEMM from GLOBAL distribution
+            # CRITICAL: After DISPATCH, we have tokens from ALL ranks for our experts
             tokens_per_expert_list = []
             for exp_id in local_experts:
-                count = routing_map[:, exp_id].sum().item()
-                tokens_per_expert_list.append(count)
+                # Count tokens from ALL ranks for this expert
+                global_count = sum(
+                    global_tokens_distribution[src_rank][exp_id].item()
+                    for src_rank in range(self.ep_size)
+                )
+                tokens_per_expert_list.append(global_count)
             tokens_per_expert = torch.tensor(tokens_per_expert_list, dtype=torch.long)
             tokens_per_expert_per_set.append(tokens_per_expert)
+
+            # ==================== REPACK: Sort tokens by expert ====================
+            # After DISPATCH, tokens are sorted by SOURCE RANK then by expert
+            # GroupedGEMM expects tokens sorted by EXPERT
+            # Layout: [src0_exp0, src0_exp1, src1_exp0, src1_exp1, ...]
+            # Need:   [all_exp0, all_exp1]
+            if current_total_recv > 0 and num_local_experts > 0 and self.ep_size > 1:
+                repacked_buffer = torch.empty_like(current_recv_buffer)
+                repacked_probs = torch.empty_like(current_recv_probs)
+
+                src_offset = 0
+                expert_offsets = [0] + list(torch.cumsum(tokens_per_expert, 0)[:-1])
+
+                for src_rank in range(self.ep_size):
+                    # For each expert in our set, extract tokens from this source
+                    for i, exp_id in enumerate(local_experts):
+                        count = global_tokens_distribution[src_rank][exp_id].item()
+                        if count > 0:
+                            # Copy from recv_buffer (sorted by source) to repacked (sorted by expert)
+                            repacked_buffer[expert_offsets[i]:expert_offsets[i] + count] = \
+                                current_recv_buffer[src_offset:src_offset + count]
+                            repacked_probs[expert_offsets[i]:expert_offsets[i] + count] = \
+                                current_recv_probs[src_offset:src_offset + count]
+                            expert_offsets[i] += count
+                            src_offset += count
+
+                current_recv_buffer = repacked_buffer
+                current_recv_probs = repacked_probs
 
             if current_total_recv > 0 and num_local_experts > 0:
                 fc1_output = gg.ops.gmm(
@@ -2952,6 +3026,27 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
             # Record compute completion (protects next_buffer from being overwritten)
             self._compute_events[current_buffer].record(torch.cuda.current_stream())
+
+            # ==================== REPACK: Restore source-rank order for COMBINE ====================
+            # fc2_output is sorted by EXPERT, but COMBINE all_to_all needs source-rank order
+            # Need to undo the earlier repack: [all_exp0][all_exp1] -> [src0_exp0,src0_exp1,src1_exp0,src1_exp1,...]
+            if current_total_recv > 0 and num_local_experts > 0 and self.ep_size > 1:
+                fc2_by_source = torch.empty_like(fc2_output)
+
+                src_offset = 0
+                expert_offsets = [0] + list(torch.cumsum(tokens_per_expert, 0)[:-1])
+
+                for src_rank in range(self.ep_size):
+                    for i, exp_id in enumerate(local_experts):
+                        count = global_tokens_distribution[src_rank][exp_id].item()
+                        if count > 0:
+                            # Copy from fc2_output (sorted by expert) to fc2_by_source (sorted by source)
+                            fc2_by_source[src_offset:src_offset + count] = \
+                                fc2_output[expert_offsets[i]:expert_offsets[i] + count]
+                            expert_offsets[i] += count
+                            src_offset += count
+
+                fc2_output = fc2_by_source
 
             # ==================== Combine Current Set (N) ====================
             set_combine_buffer = torch.empty(current_total_send, hidden_size, dtype=dtype, device=device)
@@ -3011,6 +3106,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         self: 'FusedDispatcherCacheGroupedMLP' = ctx.self
         expert_sets: List[List[int]] = ctx.expert_sets
         global_expert_sets: List[List[List[int]]] = ctx.global_expert_sets
+        global_tokens_distribution = ctx.global_tokens_distribution
         send_splits_list = ctx.send_splits_list
         recv_splits_list = ctx.recv_splits_list
         tokens_per_expert_per_set = ctx.tokens_per_expert_per_set
@@ -3153,6 +3249,27 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
             # Recompute forward with enable_grad
             if total_recv > 0 and num_local_experts > 0:
+                # ==================== REPACK: Convert grad_fc2 from source-rank to expert order ====================
+                # grad_fc2 from REVERSE COMBINE is sorted by SOURCE RANK
+                # GEMM expects tokens sorted by EXPERT
+                if self.ep_size > 1:
+                    grad_fc2_expert_order = torch.empty_like(grad_fc2)
+                    src_offset = 0
+                    expert_offsets = [0] + list(torch.cumsum(tokens_per_expert, 0)[:-1])
+
+                    for src_rank in range(self.ep_size):
+                        for i, exp_id in enumerate(local_experts):
+                            count = global_tokens_distribution[src_rank][exp_id].item()
+                            if count > 0:
+                                # Copy from grad_fc2 (source-rank order) to expert order
+                                grad_fc2_expert_order[expert_offsets[i]:expert_offsets[i] + count] = \
+                                    grad_fc2[src_offset:src_offset + count]
+                                expert_offsets[i] += count
+                                src_offset += count
+                    grad_fc2_for_gemm = grad_fc2_expert_order
+                else:
+                    grad_fc2_for_gemm = grad_fc2
+
                 with torch.enable_grad():
                     dispatched_tokens_req = dispatched_tokens.detach().requires_grad_(True)
                     w1_gpu_req = w1_gpu.detach().requires_grad_(True)
@@ -3165,7 +3282,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
                     grads = torch.autograd.grad(
                         fc2, (dispatched_tokens_req, w1_gpu_req, w2_gpu_req, probs_req),
-                        grad_outputs=grad_fc2,
+                        grad_outputs=grad_fc2_for_gemm,
                         retain_graph=False,
                         create_graph=False,
                         allow_unused=True,
@@ -3174,6 +3291,25 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                     grad_input_local = grads[0] if grads[0] is not None else torch.zeros_like(dispatched_tokens)
                     grad_w1 = grads[1]
                     grad_w2 = grads[2]
+
+                # ==================== REPACK: Convert grad_input_local from expert to source-rank order ====================
+                # grad_input_local is in EXPERT order (from GEMM)
+                # REVERSE DISPATCH expects SOURCE-RANK order
+                if self.ep_size > 1:
+                    grad_input_for_dispatch = torch.empty_like(grad_input_local)
+                    src_offset = 0
+                    expert_offsets = [0] + list(torch.cumsum(tokens_per_expert, 0)[:-1])
+
+                    for src_rank in range(self.ep_size):
+                        for i, exp_id in enumerate(local_experts):
+                            count = global_tokens_distribution[src_rank][exp_id].item()
+                            if count > 0:
+                                # Copy from expert order to source-rank order
+                                grad_input_for_dispatch[src_offset:src_offset + count] = \
+                                    grad_input_local[expert_offsets[i]:expert_offsets[i] + count]
+                                expert_offsets[i] += count
+                                src_offset += count
+                    grad_input_local = grad_input_for_dispatch
             else:
                 grad_input_local = torch.empty(0, hidden_size, dtype=dtype, device=device)
                 grad_w1 = None
