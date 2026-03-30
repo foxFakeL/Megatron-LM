@@ -2465,12 +2465,6 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
             pg_collection=pg_collection,
         )
 
-        # Import buffer manager
-        from megatron.core.transformer.moe.fused_pipeline_buffer import (
-            get_fused_pipeline_buffer_manager,
-        )
-        self._pipeline_buffer_manager = get_fused_pipeline_buffer_manager()
-
         # Communication stream for all_to_all operations
         self._comm_stream = torch.cuda.Stream()
 
@@ -2478,6 +2472,18 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
         self._comm_events = [torch.cuda.Event() for _ in range(2)]
         self._compute_events = [torch.cuda.Event() for _ in range(2)]
         self._load_events = [torch.cuda.Event() for _ in range(2)]
+
+        # Event for scatter (index_add_) completion - used by next iteration's DISPATCH
+        # This is separate from _compute_events which is used by COMBINE
+        self._scatter_done_events = [torch.cuda.Event() for _ in range(2)]
+
+        # Event for data preparation completion (build_send_buffer or grad_output slicing)
+        # CRITICAL: Ensures Comm stream waits for data to be ready before all_to_all
+        self._prep_done_events = [torch.cuda.Event() for _ in range(2)]
+
+        # Event for gradient offload synchronization
+        # Ensures D2H transfer waits for gradient computation to complete
+        self._grad_ready_event = torch.cuda.Event()
 
     def _prefetch_expert_weights_async(
         self,
@@ -2511,6 +2517,34 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
                 w2_gpu[i].copy_(self.weight2.data[exp_id], non_blocking=True)
 
         return w1_gpu, w2_gpu
+
+    def _offload_grads_to_cpu(
+        self,
+        expert_ids: List[int],
+        grad_w1: torch.Tensor,
+        grad_w2: torch.Tensor,
+    ):
+        """Override parent to add proper synchronization with gradient computation.
+
+        CRITICAL: The parent class method does not wait for gradient computation
+        to complete before starting D2H transfer. This override adds event-based
+        synchronization to ensure grad_w1/grad_w2 are ready before copying.
+
+        Flow:
+        1. Compute stream: gradient computation completes -> record _grad_ready_event
+        2. Offload stream: wait for _grad_ready_event -> async D2H copy
+        """
+        with torch.cuda.stream(self._grad_offload_stream):
+            # Wait for gradient computation to complete on compute stream
+            self._grad_ready_event.wait(self._grad_offload_stream)
+
+            for i, exp_id in enumerate(expert_ids):
+                self._grad_weight1[exp_id].copy_(grad_w1[i], non_blocking=True)
+                self._grad_weight2[exp_id].copy_(grad_w2[i], non_blocking=True)
+
+            # Critical: Lock memory lifetime to prevent GPU memory reuse before copy completes
+            grad_w1.record_stream(self._grad_offload_stream)
+            grad_w2.record_stream(self._grad_offload_stream)
 
     def _phase0_exchange_metadata(
         self,
@@ -2829,6 +2863,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         for i in range(2):
             self._compute_events[i].record(torch.cuda.current_stream())
             self._comm_events[i].record(self._comm_stream)
+            self._prep_done_events[i].record(torch.cuda.current_stream())
 
         # ========== Initialize output tensor ==========
         output = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
@@ -2869,6 +2904,10 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                     0, global_expert_sets, global_tokens_distribution
                 )
 
+            # CRITICAL: Record event after data preparation completes on compute stream
+            # Comm stream must wait for this before DISPATCH
+            self._prep_done_events[current_buffer].record(torch.cuda.current_stream())
+
             # Allocate recv buffers for Set 0
             set_recv_buffer_0 = torch.empty(total_recv_0, hidden_size, dtype=dtype, device=device)
             recv_probs_buffer_0 = torch.empty(total_recv_0, dtype=dtype, device=device)
@@ -2876,7 +2915,9 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             # Launch Set 0 Dispatch on _comm_stream
             if self.ep_size > 1:
                 with torch.cuda.stream(self._comm_stream):
-                    self._compute_events[current_buffer].wait(self._comm_stream)
+                    # Wait for data preparation to complete (buffer build finished)
+                    self._prep_done_events[current_buffer].wait(self._comm_stream)
+                    nvtx.range_push("SET0:DISPATCH")
                     torch.distributed.all_to_all_single(
                         set_recv_buffer_0, set_send_buffer_0,
                         output_split_sizes=recv_splits_0,
@@ -2889,6 +2930,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                         input_split_sizes=send_splits_0,
                         group=self.ep_group
                     )
+                    nvtx.range_pop()
                     self._comm_events[current_buffer].record(self._comm_stream)
             else:
                 # EP=1: No cross-rank communication, just use send buffers directly
@@ -2940,6 +2982,10 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                         next_set_idx, global_expert_sets, global_tokens_distribution
                     )
 
+                # CRITICAL: Record event after data preparation completes on compute stream
+                # Comm stream must wait for this before DISPATCH
+                self._prep_done_events[next_buffer].record(torch.cuda.current_stream())
+
                 # Allocate recv buffers for N+1
                 set_recv_buffer_next = torch.empty(total_recv_next, hidden_size, dtype=dtype, device=device)
                 recv_probs_buffer_next = torch.empty(total_recv_next, dtype=dtype, device=device)
@@ -2947,8 +2993,11 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 # 3. Launch N+1 Dispatch on _comm_stream
                 if self.ep_size > 1:
                     with torch.cuda.stream(self._comm_stream):
-                        # CRITICAL: Wait for next_buffer to be free (previous iteration finished)
-                        self._compute_events[next_buffer].wait(self._comm_stream)
+                        # CRITICAL: Wait for next_buffer to be free (previous iteration's scatter finished)
+                        self._scatter_done_events[next_buffer].wait(self._comm_stream)
+                        # CRITICAL: Wait for data preparation to complete (buffer build finished)
+                        self._prep_done_events[next_buffer].wait(self._comm_stream)
+                        nvtx.range_push(f"SET{next_set_idx}:DISPATCH")
                         torch.distributed.all_to_all_single(
                             set_recv_buffer_next, set_send_buffer_next,
                             output_split_sizes=recv_splits_next,
@@ -2961,6 +3010,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                             input_split_sizes=send_splits_next,
                             group=self.ep_group
                         )
+                        nvtx.range_pop()
                         self._comm_events[next_buffer].record(self._comm_stream)
                 else:
                     # EP=1: No cross-rank communication, just use send buffers directly
@@ -2991,6 +3041,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             # Layout: [src0_exp0, src0_exp1, src1_exp0, src1_exp1, ...]
             # Need:   [all_exp0, all_exp1]
             if current_total_recv > 0 and num_local_experts > 0 and self.ep_size > 1:
+                nvtx.range_push(f"SET{set_idx}:REPACK_PRE")
                 repacked_buffer = torch.empty_like(current_recv_buffer)
                 repacked_probs = torch.empty_like(current_recv_probs)
 
@@ -3012,8 +3063,11 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
                 current_recv_buffer = repacked_buffer
                 current_recv_probs = repacked_probs
+                nvtx.range_pop()
 
+            # ==================== Step 3: GEMM ====================
             if current_total_recv > 0 and num_local_experts > 0:
+                nvtx.range_push(f"SET{set_idx}:GEMM")
                 fc1_output = gg.ops.gmm(
                     current_recv_buffer, w1_gpu, tokens_per_expert, trans_b=False
                 )
@@ -3021,16 +3075,17 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 fc2_output = gg.ops.gmm(
                     intermediate, w2_gpu, tokens_per_expert, trans_b=False
                 )
+                nvtx.range_pop()
             else:
                 fc2_output = torch.empty(0, hidden_size, dtype=dtype, device=device)
 
-            # Record compute completion (protects next_buffer from being overwritten)
-            self._compute_events[current_buffer].record(torch.cuda.current_stream())
-
-            # ==================== REPACK: Restore source-rank order for COMBINE ====================
+            # ==================== Step 4: REPACK POST-GEMM ====================
             # fc2_output is sorted by EXPERT, but COMBINE all_to_all needs source-rank order
-            # Need to undo the earlier repack: [all_exp0][all_exp1] -> [src0_exp0,src0_exp1,src1_exp0,src1_exp1,...]
+            # After DISPATCH, recv_buffer is sorted by source rank: [src0_exp0, src0_exp1, src1_exp0, src1_exp1, ...]
+            # We process all tokens and output fc2_output sorted by EXPERT
+            # COMBINE sends results back to original source ranks, so need source-rank order
             if current_total_recv > 0 and num_local_experts > 0 and self.ep_size > 1:
+                nvtx.range_push(f"SET{set_idx}:REPACK_POST")
                 fc2_by_source = torch.empty_like(fc2_output)
 
                 src_offset = 0
@@ -3047,31 +3102,46 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                             src_offset += count
 
                 fc2_output = fc2_by_source
+                nvtx.range_pop()
 
-            # ==================== Combine Current Set (N) ====================
+            # Record GEMM+REPACK completion for COMBINE synchronization
+            self._compute_events[current_buffer].record(torch.cuda.current_stream())
+
+            # ==================== Step 5: COMBINE ====================
+            # COMBINE sends computed results back to original token owners
+            # Input fc2_output is sorted by SOURCE RANK, so input_split_sizes = recv_splits
+            # Output set_combine_buffer sorted by DEST RANK (who we send back to), output_split_sizes = send_splits
             set_combine_buffer = torch.empty(current_total_send, hidden_size, dtype=dtype, device=device)
             if self.ep_size > 1:
                 with torch.cuda.stream(self._comm_stream):
                     self._compute_events[current_buffer].wait(self._comm_stream)
+                    nvtx.range_push(f"SET{set_idx}:COMBINE")
                     torch.distributed.all_to_all_single(
                         set_combine_buffer, fc2_output,
-                        output_split_sizes=current_send_splits,  # REVERSED!
-                        input_split_sizes=current_recv_splits,
+                        output_split_sizes=current_send_splits,  # Send back to each rank
+                        input_split_sizes=current_recv_splits,   # From each source rank
                         group=self.ep_group
                     )
+                    nvtx.range_pop()
                     self._comm_events[current_buffer].record(self._comm_stream)
                 torch.cuda.current_stream().wait_stream(self._comm_stream)
             else:
                 set_combine_buffer = fc2_output
 
-            # ==================== Scatter Results ====================
+            # ==================== Step 6: SCATTER ====================
             if current_send_reverse_indices.numel() > 0 and set_combine_buffer.numel() > 0:
+                nvtx.range_push(f"SET{set_idx}:SCATTER")
                 output.index_add_(0, current_send_reverse_indices, set_combine_buffer)
+                nvtx.range_pop()
 
             # Save for backward
             dispatched_tokens_list.append(current_recv_buffer.detach())
             dispatched_probs_list.append(current_recv_probs.detach())
             reverse_indices_list.append(current_send_reverse_indices.detach())
+
+            # Record scatter completion for next iteration's DISPATCH
+            # This is separate from _compute_events (GEMM done) used by COMBINE
+            self._scatter_done_events[current_buffer].record(torch.cuda.current_stream())
 
             # ==================== Swap Buffers for Next Iteration ====================
             current_buffer, next_buffer = next_buffer, current_buffer
@@ -3126,6 +3196,8 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         for i in range(2):
             self._compute_events[i].record(torch.cuda.current_stream())
             self._comm_events[i].record(self._comm_stream)
+            self._scatter_done_events[i].record(torch.cuda.current_stream())
+            self._prep_done_events[i].record(torch.cuda.current_stream())
 
         # Initialize gradient for input tokens
         grad_input = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
@@ -3157,16 +3229,24 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             current_set_grad_output = grad_output[current_reverse_indices.to(device)] if current_reverse_indices.numel() > 0 else \
                 torch.empty(0, hidden_size, dtype=dtype, device=device)
 
+            # CRITICAL: Record event after data preparation completes on compute stream
+            # Comm stream must wait for this before REV_COMBINE
+            self._prep_done_events[current_buffer].record(torch.cuda.current_stream())
+
             # Launch last set's REVERSE COMBINE on _comm_stream
             current_grad_fc2 = torch.empty(current_total_recv, hidden_size, dtype=dtype, device=device)
             if self.ep_size > 1:
                 with torch.cuda.stream(self._comm_stream):
+                    # Wait for data preparation to complete (grad_output slicing finished)
+                    self._prep_done_events[current_buffer].wait(self._comm_stream)
+                    nvtx.range_push(f"SET{last_set_idx}:REV_COMBINE")
                     torch.distributed.all_to_all_single(
                         current_grad_fc2, current_set_grad_output,
-                        output_split_sizes=current_recv_splits,
-                        input_split_sizes=current_send_splits,
+                        output_split_sizes=current_recv_splits,  # To each source rank
+                        input_split_sizes=current_send_splits,   # From each dest rank
                         group=self.ep_group
                     )
+                    nvtx.range_pop()
                     self._comm_events[current_buffer].record(self._comm_stream)
             else:
                 # EP=1: No cross-rank communication, use grad_output directly
@@ -3203,18 +3283,26 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 prev_set_grad_output = grad_output[prev_reverse_indices.to(device)] if prev_reverse_indices.numel() > 0 else \
                     torch.empty(0, hidden_size, dtype=dtype, device=device)
 
+                # CRITICAL: Record event after data preparation completes on compute stream
+                # Comm stream must wait for this before REV_COMBINE
+                self._prep_done_events[next_buffer].record(torch.cuda.current_stream())
+
                 # 4. Launch prev set's REVERSE COMBINE on _comm_stream
                 prev_grad_fc2 = torch.empty(prev_total_recv, hidden_size, dtype=dtype, device=device)
                 if self.ep_size > 1:
                     with torch.cuda.stream(self._comm_stream):
-                        # CRITICAL: Wait for next_buffer to be free
-                        self._compute_events[next_buffer].wait(self._comm_stream)
+                        # CRITICAL: Wait for next_buffer to be free (previous iteration's scatter finished)
+                        self._scatter_done_events[next_buffer].wait(self._comm_stream)
+                        # CRITICAL: Wait for data preparation to complete (grad_output slicing finished)
+                        self._prep_done_events[next_buffer].wait(self._comm_stream)
+                        nvtx.range_push(f"SET{prev_set_idx}:REV_COMBINE")
                         torch.distributed.all_to_all_single(
                             prev_grad_fc2, prev_set_grad_output,
-                            output_split_sizes=prev_recv_splits,
-                            input_split_sizes=prev_send_splits,
+                            output_split_sizes=prev_recv_splits,  # To each source rank
+                            input_split_sizes=prev_send_splits,   # From each dest rank
                             group=self.ep_group
                         )
+                        nvtx.range_pop()
                         self._comm_events[next_buffer].record(self._comm_stream)
                 else:
                     # EP=1: No cross-rank communication, use grad_output directly
@@ -3253,6 +3341,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 # grad_fc2 from REVERSE COMBINE is sorted by SOURCE RANK
                 # GEMM expects tokens sorted by EXPERT
                 if self.ep_size > 1:
+                    nvtx.range_push(f"SET{set_idx}:BW_REPACK_PRE")
                     grad_fc2_expert_order = torch.empty_like(grad_fc2)
                     src_offset = 0
                     expert_offsets = [0] + list(torch.cumsum(tokens_per_expert, 0)[:-1])
@@ -3267,9 +3356,11 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                                 expert_offsets[i] += count
                                 src_offset += count
                     grad_fc2_for_gemm = grad_fc2_expert_order
+                    nvtx.range_pop()
                 else:
                     grad_fc2_for_gemm = grad_fc2
 
+                nvtx.range_push(f"SET{set_idx}:BW_GEMM")
                 with torch.enable_grad():
                     dispatched_tokens_req = dispatched_tokens.detach().requires_grad_(True)
                     w1_gpu_req = w1_gpu.detach().requires_grad_(True)
@@ -3287,15 +3378,17 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                         create_graph=False,
                         allow_unused=True,
                     )
+                nvtx.range_pop()
 
-                    grad_input_local = grads[0] if grads[0] is not None else torch.zeros_like(dispatched_tokens)
-                    grad_w1 = grads[1]
-                    grad_w2 = grads[2]
+                grad_input_local = grads[0] if grads[0] is not None else torch.zeros_like(dispatched_tokens)
+                grad_w1 = grads[1]
+                grad_w2 = grads[2]
 
                 # ==================== REPACK: Convert grad_input_local from expert to source-rank order ====================
                 # grad_input_local is in EXPERT order (from GEMM)
-                # REVERSE DISPATCH expects SOURCE-RANK order
+                # REVERSE DISPATCH needs SOURCE-RANK order (send back to original owners)
                 if self.ep_size > 1:
+                    nvtx.range_push(f"SET{set_idx}:BW_REPACK_POST")
                     grad_input_for_dispatch = torch.empty_like(grad_input_local)
                     src_offset = 0
                     expert_offsets = [0] + list(torch.cumsum(tokens_per_expert, 0)[:-1])
@@ -3310,29 +3403,42 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                                 expert_offsets[i] += count
                                 src_offset += count
                     grad_input_local = grad_input_for_dispatch
+                    nvtx.range_pop()
+
+                    # Record GEMM/REPACK completion for REVERSE DISPATCH synchronization
+                    self._compute_events[current_buffer].record(torch.cuda.current_stream())
             else:
                 grad_input_local = torch.empty(0, hidden_size, dtype=dtype, device=device)
                 grad_w1 = None
                 grad_w2 = None
+                # Still need to record event for REVERSE DISPATCH synchronization
+                self._compute_events[current_buffer].record(torch.cuda.current_stream())
 
             # Offload weight gradients
             if grad_w1 is not None and grad_w2 is not None:
+                nvtx.range_push(f"SET{set_idx}:GRAD_OFFLOAD")
+                # Record event AFTER gradient computation completes
+                # This ensures D2H transfer waits for gradients to be ready
+                self._grad_ready_event.record(torch.cuda.current_stream())
                 self._offload_grads_to_cpu(local_experts, grad_w1, grad_w2)
-
-            # Record compute completion
-            self._compute_events[current_buffer].record(torch.cuda.current_stream())
+                nvtx.range_pop()
 
             # ==================== REVERSE DISPATCH ====================
+            # REVERSE DISPATCH sends gradients back to original token owners (source ranks)
+            # Input grad_input_local sorted by SOURCE RANK, input_split_sizes = recv_splits
+            # Output grad_input_remote sorted by DEST RANK, output_split_sizes = send_splits
             grad_input_remote = torch.empty(total_send, hidden_size, dtype=dtype, device=device)
             if self.ep_size > 1:
                 with torch.cuda.stream(self._comm_stream):
                     self._compute_events[current_buffer].wait(self._comm_stream)
+                    nvtx.range_push(f"SET{set_idx}:REV_DISPATCH")
                     torch.distributed.all_to_all_single(
                         grad_input_remote, grad_input_local,
-                        output_split_sizes=send_splits,
-                        input_split_sizes=recv_splits,
+                        output_split_sizes=send_splits,   # To each dest rank
+                        input_split_sizes=recv_splits,    # From each source rank
                         group=self.ep_group
                     )
+                    nvtx.range_pop()
                     self._comm_events[current_buffer].record(self._comm_stream)
                 torch.cuda.current_stream().wait_stream(self._comm_stream)
             else:
@@ -3340,7 +3446,13 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
             # Scatter gradients back to original token positions
             if set_reverse_indices.numel() > 0 and grad_input_remote.numel() > 0:
-                grad_input.index_add_(0, set_reverse_indices.to(device), grad_input_remote)
+                nvtx.range_push(f"SET{set_idx}:BW_SCATTER")
+                grad_input.index_add_(0, set_reverse_indices, grad_input_remote)
+                nvtx.range_pop()
+
+            # Record scatter completion for next iteration
+            # This is separate from _compute_events (GEMM done) used by REVERSE DISPATCH
+            self._scatter_done_events[current_buffer].record(torch.cuda.current_stream())
 
             # ==================== Swap Buffers ====================
             current_buffer, next_buffer = next_buffer, current_buffer

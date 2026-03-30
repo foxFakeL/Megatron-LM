@@ -152,13 +152,13 @@ def test_single_gpu_accuracy():
     torch.cuda.manual_seed(seed)
 
     # Test parameters
-    num_global_experts = 8
-    hidden_size = 256
-    ffn_hidden_size = 512
-    batch_size = 4
-    seq_len = 128
+    num_global_experts = 64
+    hidden_size = 2560
+    ffn_hidden_size = 5120
+    batch_size = 2
+    seq_len = 64000
     num_tokens = batch_size * seq_len
-    topk = 2
+    topk = 4
     dtype = torch.bfloat16
     device = torch.device("cuda", local_rank)
 
@@ -195,7 +195,7 @@ def test_single_gpu_accuracy():
     output_ref = reference_moe_forward(
         hidden_states_ref, routing_map, probs, weight1_ref, weight2_ref, glu_activation
     )
-    loss_ref = output_ref.sum()
+    loss_ref = output_ref.mean()
     loss_ref.backward()
 
     grad_input_ref = hidden_states_ref.grad.clone()
@@ -270,7 +270,7 @@ def test_single_gpu_accuracy():
         expert_sets=expert_sets,
     )
 
-    loss_fused = output_fused.sum()
+    loss_fused = output_fused.mean()
     loss_fused.backward()
 
     # Sync gradients
@@ -373,11 +373,11 @@ def test_multi_expert_sets():
     torch.cuda.manual_seed(seed)
 
     # Test parameters
-    num_global_experts = 16
-    hidden_size = 256
-    ffn_hidden_size = 512
+    num_global_experts = 64
+    hidden_size = 2560
+    ffn_hidden_size = 5120
     batch_size = 2
-    seq_len = 64
+    seq_len = 64000
     num_tokens = batch_size * seq_len
     topk = 4
     dtype = torch.bfloat16
@@ -393,7 +393,7 @@ def test_multi_expert_sets():
 
     # Generate input and routing
     torch.manual_seed(seed + 200)
-    hidden_states = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device)
+    hidden_states = (torch.randn(num_tokens, hidden_size, dtype=dtype, device=device) * 0.01)
     router_logits = torch.randn(num_tokens, num_global_experts, dtype=dtype, device=device)
     probs_full = F.softmax(router_logits.float(), dim=-1).to(dtype)
     topk_probs, topk_indices = probs_full.topk(topk, dim=-1)
@@ -412,7 +412,7 @@ def test_multi_expert_sets():
     output_ref = reference_moe_forward(
         hidden_states_ref, routing_map, probs, weight1_ref, weight2_ref, glu_activation
     )
-    loss_ref = output_ref.sum()
+    loss_ref = output_ref.mean()
     loss_ref.backward()
     grad_input_ref = hidden_states_ref.grad.clone()
 
@@ -469,7 +469,7 @@ def test_multi_expert_sets():
         probs=probs,
         expert_sets=expert_sets,
     )
-    loss_fused = output_fused.sum()
+    loss_fused = output_fused.mean()
     loss_fused.backward()
     fused_mlp.sync_gradients()
 
