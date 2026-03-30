@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from copy import deepcopy
 from functools import partial
 from math import ceil
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -1269,6 +1269,103 @@ class ActivationCache:
         return self._cpu_buffer is not None
 
 
+class PerSetActivationCache:
+    """Per-set activation offload for FusedDispatcherCacheGroupedMLP.
+
+    Handles offloading dispatched_tokens (per expert set) to CPU during forward pass
+    and prefetching them back to GPU per set during backward pass.
+
+    Key design:
+    - CPU buffers are dynamically allocated per set (each set may have different token counts)
+    - GPU prefetch uses double buffering to overlap with compute
+    - Prefetch is done on _load_stream to overlap with weight loading
+    """
+
+    def __init__(self, enabled: bool = True):
+        self.enabled = enabled
+        # Per-set CPU buffers: dict mapping set_idx -> tensor
+        self._cpu_buffers: Dict[int, torch.Tensor] = {}
+        # CUDA stream for async D2H transfer (offload to CPU)
+        self._offload_stream: Optional[torch.cuda.Stream] = None
+        # Event to record when offload completes
+        self._offload_done_event: Optional[torch.cuda.Event] = None
+
+    def offload_set_async(self, tensor: torch.Tensor, set_idx: int) -> None:
+        """Async copy set's dispatched_tokens to pinned CPU memory.
+
+        Args:
+            tensor: The GPU tensor (dispatched_tokens for this set) to offload.
+            set_idx: The set index for this tensor.
+        """
+        if not self.enabled:
+            return
+        if self._offload_stream is None:
+            self._offload_stream = torch.cuda.Stream()
+        if self._offload_done_event is None:
+            self._offload_done_event = torch.cuda.Event()
+
+        # Allocate or reallocate CPU buffer if needed
+        if set_idx not in self._cpu_buffers or self._cpu_buffers[set_idx].shape != tensor.shape:
+            self._cpu_buffers[set_idx] = torch.empty_like(
+                tensor.detach(), device='cpu', pin_memory=True
+            )
+
+        with torch.cuda.stream(self._offload_stream):
+            self._cpu_buffers[set_idx].copy_(tensor.detach(), non_blocking=True)
+            # Record event after copy completes
+            self._offload_done_event.record(self._offload_stream)
+
+    def wait_offload(self) -> None:
+        """Wait for all async offloads to complete."""
+        if not self.enabled or self._offload_stream is None or self._offload_done_event is None:
+            return
+        torch.cuda.current_stream().wait_stream(self._offload_stream)
+
+    def prefetch_set_to_gpu(
+        self,
+        set_idx: int,
+        gpu_buffer: torch.Tensor,
+        load_stream: torch.cuda.Stream,
+    ) -> None:
+        """Async prefetch set's activation to GPU buffer.
+
+        Args:
+            set_idx: The set index to prefetch.
+            gpu_buffer: The GPU tensor buffer to copy into.
+            load_stream: CUDA stream for async H2D transfer.
+        """
+        if not self.enabled:
+            return
+        if set_idx not in self._cpu_buffers:
+            raise RuntimeError(f"No activation cached for set {set_idx}")
+
+        cpu_tensor = self._cpu_buffers[set_idx]
+        if cpu_tensor.shape[0] == 0:
+            return  # Skip empty sets
+
+        with torch.cuda.stream(load_stream):
+            # Ensure gpu_buffer is correctly sized
+            if gpu_buffer.shape != cpu_tensor.shape:
+                # Resize not possible - just copy what fits or error
+                raise RuntimeError(
+                    f"GPU buffer shape {gpu_buffer.shape} doesn't match "
+                    f"CPU tensor shape {cpu_tensor.shape} for set {set_idx}"
+                )
+            gpu_buffer.copy_(cpu_tensor, non_blocking=True)
+
+    def get_cpu_buffer(self, set_idx: int) -> Optional[torch.Tensor]:
+        """Get the CPU buffer for a specific set."""
+        return self._cpu_buffers.get(set_idx)
+
+    def clear(self) -> None:
+        """Clear all cached activations."""
+        self._cpu_buffers.clear()
+
+    def has_cached(self, set_idx: int) -> bool:
+        """Check if there is a cached activation for a specific set."""
+        return set_idx in self._cpu_buffers
+
+
 class SequentialMLPFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, self, permuted_local_hidden_states, tokens_per_expert, permuted_probs):
@@ -2485,6 +2582,13 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
         # Ensures D2H transfer waits for gradient computation to complete
         self._grad_ready_event = torch.cuda.Event()
 
+        # Per-set activation cache for memory-efficient backward (if enabled)
+        # Inherit activation_offload from parent CacheGroupedMLP
+        if self.activation_offload:
+            self._per_set_activation_cache = PerSetActivationCache(enabled=True)
+        else:
+            self._per_set_activation_cache = PerSetActivationCache(enabled=False)
+
     def _prefetch_expert_weights_async(
         self,
         expert_ids: List[int],
@@ -3083,6 +3187,14 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                     intermediate, w2_gpu, tokens_per_expert, trans_b=False
                 )
                 nvtx.range_pop()
+
+                # ==================== Activation Offload (Async) ====================
+                # Offload dispatched_tokens to CPU during compute to save GPU memory
+                # This overlaps D2H transfer with weight loading and compute
+                if self.activation_offload:
+                    self._per_set_activation_cache.offload_set_async(
+                        current_recv_buffer, set_idx
+                    )
             else:
                 fc2_output = torch.empty(0, hidden_size, dtype=dtype, device=device)
 
@@ -3142,7 +3254,9 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 nvtx.range_pop()
 
             # Save for backward
-            dispatched_tokens_list.append(current_recv_buffer.detach())
+            # Only save dispatched_tokens_list if NOT offloading to CPU
+            if not self.activation_offload:
+                dispatched_tokens_list.append(current_recv_buffer.detach())
             dispatched_probs_list.append(current_recv_probs.detach())
             reverse_indices_list.append(current_send_reverse_indices.detach())
             expert_ids_per_set.append(current_send_expert_ids.detach())  # For probs gradient scatter
@@ -3169,7 +3283,13 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
         nvtx.range_pop()
 
-        # Save for backward
+        # Wait for all activation offloads to complete before returning
+        # This ensures CPU buffers are ready for backward
+        if self.activation_offload:
+            self._per_set_activation_cache.wait_offload()
+
+        # Save for backward - structure depends on activation_offload
+        ctx.activation_offloaded = self.activation_offload
         ctx.save_for_backward(*dispatched_tokens_list, *dispatched_probs_list, *reverse_indices_list, *expert_ids_per_set)
         ctx.send_splits_list = send_splits_list
         ctx.recv_splits_list = recv_splits_list
@@ -3192,12 +3312,25 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         hidden_size = ctx.hidden_size
         num_tokens = ctx.num_tokens
 
-        # Retrieve saved tensors
+        # Retrieve saved tensors - structure depends on activation_offload
         num_sets = ctx.num_sets
-        dispatched_tensors = ctx.saved_tensors[:num_sets]
-        dispatched_probs = ctx.saved_tensors[num_sets:2*num_sets]
-        reverse_indices_list = ctx.saved_tensors[2*num_sets:3*num_sets]
-        expert_ids_per_set = ctx.saved_tensors[3*num_sets:4*num_sets]  # For probs gradient scatter
+        activation_offloaded = ctx.activation_offloaded
+
+        if activation_offloaded:
+            # When activation is offloaded: dispatched_tensors are NOT saved
+            # dispatched_probs, reverse_indices, expert_ids are saved
+            # Saved tensors structure: [dispatched_probs..., reverse_indices..., expert_ids...]
+            dispatched_probs = ctx.saved_tensors[:num_sets]
+            reverse_indices_list = ctx.saved_tensors[num_sets:2*num_sets]
+            expert_ids_per_set = ctx.saved_tensors[2*num_sets:3*num_sets]
+            dispatched_tensors = None  # Will be loaded from cache per set
+        else:
+            # Normal case: all tensors are saved
+            # Saved tensors structure: [dispatched_tokens..., dispatched_probs..., reverse_indices..., expert_ids...]
+            dispatched_tensors = ctx.saved_tensors[:num_sets]
+            dispatched_probs = ctx.saved_tensors[num_sets:2*num_sets]
+            reverse_indices_list = ctx.saved_tensors[2*num_sets:3*num_sets]
+            expert_ids_per_set = ctx.saved_tensors[3*num_sets:4*num_sets]
 
         device = grad_output.device
         dtype = grad_output.dtype
@@ -3223,22 +3356,44 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
         # ==================== Prologue: Prepare Last Set (len-1) ====================
         last_set_idx = len(expert_sets) - 1
+        # GPU buffer for activation prefetch (double-buffered, reused across sets)
+        activation_gpu_buffers = [None, None]
+
         if last_set_idx >= 0:
             last_experts = global_expert_sets[self.ep_rank][last_set_idx]
 
             # Async load last set weights to current_buffer
             self._prefetch_expert_weights_async(last_experts, current_buffer)
 
-            # Get saved data for last set
-            current_dispatched_tokens = dispatched_tensors[last_set_idx]
-            current_dispatched_probs = dispatched_probs[last_set_idx]
-            current_reverse_indices = reverse_indices_list[last_set_idx]
-            current_expert_ids = expert_ids_per_set[last_set_idx]  # For probs gradient scatter
-            current_tokens_per_expert = tokens_per_expert_per_set[last_set_idx]
+            # Get splits first (needed for prefetch buffer sizing)
             current_send_splits = send_splits_list[last_set_idx]
             current_recv_splits = recv_splits_list[last_set_idx]
             current_total_send = sum(current_send_splits)
             current_total_recv = sum(current_recv_splits)
+
+            # Async prefetch last set's activation from CPU cache (if offloaded)
+            if activation_offloaded and current_total_recv > 0:
+                # Allocate GPU buffer for this set's activation
+                activation_gpu_buffers[current_buffer] = torch.empty(
+                    current_total_recv, hidden_size, dtype=dtype, device=device
+                )
+                # Async prefetch on _load_stream (overlaps with weight loading)
+                nvtx.range_push(f"SET{last_set_idx}:ACT_PREFETCH")
+                self._per_set_activation_cache.prefetch_set_to_gpu(
+                    last_set_idx, activation_gpu_buffers[current_buffer], self._load_stream
+                )
+                nvtx.range_pop()
+
+            # Get saved data for last set
+            if activation_offloaded:
+                # dispatched_tokens will be retrieved from GPU buffer after wait_stream
+                current_dispatched_tokens = None  # Placeholder, will be set after wait_stream
+            else:
+                current_dispatched_tokens = dispatched_tensors[last_set_idx]
+            current_dispatched_probs = dispatched_probs[last_set_idx]
+            current_reverse_indices = reverse_indices_list[last_set_idx]
+            current_expert_ids = expert_ids_per_set[last_set_idx]  # For probs gradient scatter
+            current_tokens_per_expert = tokens_per_expert_per_set[last_set_idx]
 
             # Get grad_output for last set's tokens
             current_set_grad_output = grad_output[current_reverse_indices.to(device)] if current_reverse_indices.numel() > 0 else \
@@ -3271,7 +3426,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         for set_idx in range(last_set_idx, -1, -1):
             local_experts = global_expert_sets[self.ep_rank][set_idx]
 
-            # Wait for current buffer to be ready
+            # Wait for current buffer to be ready (weights + activation prefetch)
             torch.cuda.current_stream().wait_stream(self._load_stream)
             if self.ep_size > 1:
                 torch.cuda.current_stream().wait_stream(self._comm_stream)
@@ -3285,7 +3440,10 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 self._prefetch_expert_weights_async(prev_experts, next_buffer)
 
                 # 2. Get saved data for prev set
-                prev_dispatched_tokens = dispatched_tensors[prev_set_idx]
+                if activation_offloaded:
+                    prev_dispatched_tokens = None  # Will be prefetched
+                else:
+                    prev_dispatched_tokens = dispatched_tensors[prev_set_idx]
                 prev_dispatched_probs = dispatched_probs[prev_set_idx]
                 prev_reverse_indices = reverse_indices_list[prev_set_idx]
                 prev_expert_ids = expert_ids_per_set[prev_set_idx]  # For probs gradient scatter
@@ -3295,7 +3453,18 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 prev_total_send = sum(prev_send_splits)
                 prev_total_recv = sum(prev_recv_splits)
 
-                # 3. Get grad_output for prev set's tokens
+                # 3. Async prefetch prev set's activation (if offloaded)
+                if activation_offloaded and prev_total_recv > 0:
+                    activation_gpu_buffers[next_buffer] = torch.empty(
+                        prev_total_recv, hidden_size, dtype=dtype, device=device
+                    )
+                    nvtx.range_push(f"SET{prev_set_idx}:ACT_PREFETCH")
+                    self._per_set_activation_cache.prefetch_set_to_gpu(
+                        prev_set_idx, activation_gpu_buffers[next_buffer], self._load_stream
+                    )
+                    nvtx.range_pop()
+
+                # 4. Get grad_output for prev set's tokens
                 prev_set_grad_output = grad_output[prev_reverse_indices.to(device)] if prev_reverse_indices.numel() > 0 else \
                     torch.empty(0, hidden_size, dtype=dtype, device=device)
 
@@ -3329,29 +3498,29 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             w1_gpu = self._w1_gpu_workspace[current_buffer, :num_local_experts]
             w2_gpu = self._w2_gpu_workspace[current_buffer, :num_local_experts]
 
-            # Use current set's data (from prologue or previous iteration)
-            if set_idx == last_set_idx:
-                dispatched_tokens = current_dispatched_tokens
-                dispatched_probs_t = current_dispatched_probs
-                tokens_per_expert = current_tokens_per_expert
-                grad_fc2 = current_grad_fc2
-                total_send = current_total_send
-                total_recv = current_total_recv
-                send_splits = current_send_splits
-                recv_splits = current_recv_splits
-                set_reverse_indices = current_reverse_indices
-                set_expert_ids = current_expert_ids  # For probs gradient scatter
+            # Get dispatched_tokens for current set
+            if activation_offloaded:
+                # dispatched_tokens comes from GPU buffer (prefetched in prologue or prev iteration)
+                if activation_gpu_buffers[current_buffer] is not None:
+                    dispatched_tokens = activation_gpu_buffers[current_buffer]
+                else:
+                    dispatched_tokens = torch.empty(0, hidden_size, dtype=dtype, device=device)
             else:
-                dispatched_tokens = dispatched_tensors[set_idx]
-                dispatched_probs_t = dispatched_probs[set_idx]
-                tokens_per_expert = tokens_per_expert_per_set[set_idx]
-                grad_fc2 = current_grad_fc2
-                total_send = current_total_send
-                total_recv = current_total_recv
-                send_splits = current_send_splits
-                recv_splits = current_recv_splits
-                set_reverse_indices = current_reverse_indices
-                set_expert_ids = current_expert_ids  # For probs gradient scatter
+                # Normal case: dispatched_tokens comes from saved tensors
+                if set_idx == last_set_idx:
+                    dispatched_tokens = current_dispatched_tokens
+                else:
+                    dispatched_tokens = dispatched_tensors[set_idx]
+
+            dispatched_probs_t = current_dispatched_probs
+            tokens_per_expert = current_tokens_per_expert
+            grad_fc2 = current_grad_fc2
+            total_send = current_total_send
+            total_recv = current_total_recv
+            send_splits = current_send_splits
+            recv_splits = current_recv_splits
+            set_reverse_indices = current_reverse_indices
+            set_expert_ids = current_expert_ids  # For probs gradient scatter
 
             # Recompute forward with enable_grad
             if total_recv > 0 and num_local_experts > 0:
