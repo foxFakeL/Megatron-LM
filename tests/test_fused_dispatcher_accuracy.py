@@ -100,6 +100,97 @@ def reference_moe_forward(
     return output
 
 
+def reference_moe_forward_with_probs_grad(
+    hidden_states: torch.Tensor,
+    routing_map: torch.Tensor,
+    probs: torch.Tensor,
+    weight1: torch.Tensor,
+    weight2: torch.Tensor,
+    activation_func,
+):
+    """Reference implementation that also computes probs gradient.
+
+    Returns:
+        output: [num_tokens, hidden_size]
+        intermediate_list: list of intermediate tensors for backward
+        metadata_list: list of (token_indices, expert_probs) for backward
+    """
+    num_tokens, hidden_size = hidden_states.shape
+    num_experts = weight1.shape[0]
+    output = torch.zeros(
+        num_tokens, hidden_size, dtype=hidden_states.dtype, device=hidden_states.device
+    )
+    intermediate_list = []
+    metadata_list = []
+
+    for exp_id in range(num_experts):
+        expert_mask = routing_map[:, exp_id]
+        if not expert_mask.any():
+            continue
+
+        token_indices = expert_mask.nonzero(as_tuple=True)[0]
+        expert_input = hidden_states[token_indices]
+        expert_probs = probs[token_indices, exp_id]
+
+        fc1_out = expert_input @ weight1[exp_id]
+        intermediate = activation_func(fc1_out) * expert_probs.unsqueeze(-1)
+        fc2_out = intermediate @ weight2[exp_id]
+
+        output.index_add_(0, token_indices, fc2_out)
+
+        # Save for backward
+        intermediate_list.append(intermediate)
+        metadata_list.append((token_indices, expert_probs, exp_id))
+
+    return output, intermediate_list, metadata_list
+
+
+def reference_moe_backward_probs(
+    grad_output: torch.Tensor,
+    intermediate_list: list,
+    metadata_list: list,
+    weight2: torch.Tensor,
+    routing_map: torch.Tensor,
+    num_experts: int,
+):
+    """Compute probs gradient from saved intermediate tensors.
+
+    Args:
+        grad_output: [num_tokens, hidden_size]
+        intermediate_list: list of intermediate tensors
+        metadata_list: list of (token_indices, expert_probs, exp_id)
+        weight2: [num_experts, ffn_hidden_size, hidden_size]
+        routing_map: [num_tokens, num_experts]
+        num_experts: number of experts
+
+    Returns:
+        grad_probs: [num_tokens, num_experts]
+    """
+    num_tokens = grad_output.shape[0]
+    dtype = grad_output.dtype
+    device = grad_output.device
+    grad_probs = torch.zeros(num_tokens, num_experts, dtype=dtype, device=device)
+
+    for intermediate, (token_indices, expert_probs, exp_id) in zip(intermediate_list, metadata_list):
+        # grad_output for this expert's tokens
+        grad_out_expert = grad_output[token_indices]
+
+        # Backward through fc2: grad_intermediate = grad_out @ weight2.T
+        grad_intermediate = grad_out_expert @ weight2[exp_id].T
+
+        # Backward through probs scaling: grad_probs = (grad_intermediate * activation(fc1)).sum(-1)
+        # intermediate = activation(fc1) * probs.unsqueeze(-1)
+        # So grad_probs = (grad_intermediate * activation(fc1)).sum(-1)
+        # But activation(fc1) = intermediate / probs.unsqueeze(-1)
+        grad_probs_expert = (grad_intermediate * (intermediate / expert_probs.unsqueeze(-1))).sum(-1)
+
+        # Scatter back to grad_probs
+        for i, idx in enumerate(token_indices):
+            grad_probs[idx, exp_id] = grad_probs_expert[i]
+
+    return grad_probs
+
+
 def glu_activation(x: torch.Tensor) -> torch.Tensor:
     """Gated Linear Unit activation: silu(x[0]) * x[1]."""
     x = torch.chunk(x, 2, dim=-1)
@@ -189,22 +280,25 @@ def test_single_gpu_accuracy():
     # ========== Reference Implementation ==========
     print("\n=== Reference Implementation ===")
     hidden_states_ref = hidden_states.detach().clone().requires_grad_(True)
+    probs_ref = probs.detach().clone().requires_grad_(True)  # Enable probs gradient
     weight1_ref = weight1.detach().clone().requires_grad_(True)
     weight2_ref = weight2.detach().clone().requires_grad_(True)
 
     output_ref = reference_moe_forward(
-        hidden_states_ref, routing_map, probs, weight1_ref, weight2_ref, glu_activation
+        hidden_states_ref, routing_map, probs_ref, weight1_ref, weight2_ref, glu_activation
     )
     loss_ref = output_ref.mean()
     loss_ref.backward()
 
     grad_input_ref = hidden_states_ref.grad.clone()
+    grad_probs_ref = probs_ref.grad.clone()  # Get probs gradient
     grad_w1_ref = weight1_ref.grad.clone()
     grad_w2_ref = weight2_ref.grad.clone()
 
     print(f"Reference output shape: {output_ref.shape}")
     print(f"Reference loss: {loss_ref.item():.6f}")
     print(f"Reference grad_input norm: {grad_input_ref.norm().item():.6f}")
+    print(f"Reference grad_probs norm: {grad_probs_ref.norm().item():.6f}")
 
     # ========== FusedDispatcher Implementation ==========
     print("\n=== FusedDispatcher Implementation ===")
@@ -263,10 +357,11 @@ def test_single_gpu_accuracy():
 
     # Forward pass
     hidden_states_fused = hidden_states.detach().clone().requires_grad_(True)
+    probs_fused = probs.detach().clone().requires_grad_(True)  # Enable probs gradient
     output_fused, _ = fused_mlp(
         hidden_states=hidden_states_fused,
         routing_map=routing_map,
-        probs=probs,
+        probs=probs_fused,
         expert_sets=expert_sets,
     )
 
@@ -277,12 +372,14 @@ def test_single_gpu_accuracy():
     fused_mlp.sync_gradients()
 
     grad_input_fused = hidden_states_fused.grad.clone()
+    grad_probs_fused = probs_fused.grad.clone()  # Get probs gradient
     grad_w1_fused = fused_mlp.weight1.grad.clone().to(device) if fused_mlp.weight1.grad is not None else None
     grad_w2_fused = fused_mlp.weight2.grad.clone().to(device) if fused_mlp.weight2.grad is not None else None
 
     print(f"Fused output shape: {output_fused.shape}")
     print(f"Fused loss: {loss_fused.item():.6f}")
     print(f"Fused grad_input norm: {grad_input_fused.norm().item():.6f}")
+    print(f"Fused grad_probs norm: {grad_probs_fused.norm().item():.6f}")
 
     # ========== Compare Results ==========
     print("\n=== Comparison ===")
@@ -307,6 +404,14 @@ def test_single_gpu_accuracy():
     print(f"Gradient max diff: {grad_max_diff:.6e}")
     print(f"Gradient mean diff: {grad_mean_diff:.6e}")
 
+    # Probs gradient comparison
+    probs_grad_diff = (grad_probs_fused - grad_probs_ref).abs()
+    probs_grad_max_diff = probs_grad_diff.max().item()
+    probs_grad_mean_diff = probs_grad_diff.mean().item()
+
+    print(f"Probs gradient max diff: {probs_grad_max_diff:.6e}")
+    print(f"Probs gradient mean diff: {probs_grad_mean_diff:.6e}")
+
     # Weight gradient comparison (only for local experts)
     if grad_w1_fused is not None and grad_w2_fused is not None:
         # Compare only the gradients for experts this rank processes
@@ -326,11 +431,13 @@ def test_single_gpu_accuracy():
     # bf16 has ~1% relative precision, but we use absolute tolerance for small values
     output_max = max(output_ref.abs().max().item(), output_fused.abs().max().item())
     grad_max = max(grad_input_ref.abs().max().item(), grad_input_fused.abs().max().item())
+    probs_grad_max = max(grad_probs_ref.abs().max().item(), grad_probs_fused.abs().max().item())
     relative_tolerance = 0.01  # 1% relative tolerance for bf16
     absolute_tolerance = 1.0   # For values near zero
 
     forward_threshold = max(output_max * relative_tolerance, absolute_tolerance)
     grad_threshold = max(grad_max * relative_tolerance, absolute_tolerance)
+    probs_grad_threshold = max(probs_grad_max * relative_tolerance, absolute_tolerance)
 
     if forward_max_diff > forward_threshold:
         print(f"\n❌ FAIL: Forward output mismatch (max diff: {forward_max_diff:.6e}, threshold: {forward_threshold:.6e})")
@@ -343,9 +450,18 @@ def test_single_gpu_accuracy():
         print(f"\n❌ FAIL: Gradient mismatch (max diff: {grad_max_diff:.6e}, threshold: {grad_threshold:.6e})")
         return False
 
+    if probs_grad_max_diff > probs_grad_threshold:
+        print(f"\n❌ FAIL: Probs gradient mismatch (max diff: {probs_grad_max_diff:.6e}, threshold: {probs_grad_threshold:.6e})")
+        # Print debug info
+        nonzero_mask = routing_map.any(dim=1)
+        print(f"Probs grad ref sample (first 5 routed tokens): {grad_probs_ref[nonzero_mask][:5, :5]}")
+        print(f"Probs grad fused sample: {grad_probs_fused[nonzero_mask][:5, :5]}")
+        return False
+
     print(f"\n✅ PASS: Accuracy test passed!")
     print(f"   Forward max diff: {forward_max_diff:.6e} < {forward_threshold:.6e}")
     print(f"   Gradient max diff: {grad_max_diff:.6e} < {grad_threshold:.6e}")
+    print(f"   Probs gradient max diff: {probs_grad_max_diff:.6e} < {probs_grad_threshold:.6e}")
     return True
 
 
@@ -406,15 +522,17 @@ def test_multi_expert_sets():
 
     # Reference implementation
     hidden_states_ref = hidden_states.detach().clone().requires_grad_(True)
+    probs_ref = probs.detach().clone().requires_grad_(True)
     weight1_ref = weight1.detach().clone().requires_grad_(True)
     weight2_ref = weight2.detach().clone().requires_grad_(True)
 
     output_ref = reference_moe_forward(
-        hidden_states_ref, routing_map, probs, weight1_ref, weight2_ref, glu_activation
+        hidden_states_ref, routing_map, probs_ref, weight1_ref, weight2_ref, glu_activation
     )
     loss_ref = output_ref.mean()
     loss_ref.backward()
     grad_input_ref = hidden_states_ref.grad.clone()
+    grad_probs_ref = probs_ref.grad.clone()
 
     # Fused implementation
     config = TransformerConfig(
@@ -463,10 +581,11 @@ def test_multi_expert_sets():
     print(f"Rank {rank} expert_sets: {expert_sets}")
 
     hidden_states_fused = hidden_states.detach().clone().requires_grad_(True)
+    probs_fused = probs.detach().clone().requires_grad_(True)
     output_fused, _ = fused_mlp(
         hidden_states=hidden_states_fused,
         routing_map=routing_map,
-        probs=probs,
+        probs=probs_fused,
         expert_sets=expert_sets,
     )
     loss_fused = output_fused.mean()
@@ -474,13 +593,16 @@ def test_multi_expert_sets():
     fused_mlp.sync_gradients()
 
     grad_input_fused = hidden_states_fused.grad.clone()
+    grad_probs_fused = probs_fused.grad.clone()
 
     # Compare
     forward_diff = (output_fused - output_ref).abs().max().item()
     grad_diff = (grad_input_fused - grad_input_ref).abs().max().item()
+    probs_grad_diff = (grad_probs_fused - grad_probs_ref).abs().max().item()
 
     print(f"Forward max diff: {forward_diff:.6e}")
     print(f"Gradient max diff: {grad_diff:.6e}")
+    print(f"Probs gradient max diff: {probs_grad_diff:.6e}")
 
     # Cleanup
     fused_mlp.release()
@@ -491,19 +613,33 @@ def test_multi_expert_sets():
     # Use relative tolerance for bf16
     output_max = max(output_ref.abs().max().item(), output_fused.abs().max().item())
     grad_max = max(grad_input_ref.abs().max().item(), grad_input_fused.abs().max().item())
+    probs_grad_max = max(grad_probs_ref.abs().max().item(), grad_probs_fused.abs().max().item())
     relative_tolerance = 0.01  # 1% relative tolerance for bf16
     absolute_tolerance = 1.0   # For values near zero
 
     forward_threshold = max(output_max * relative_tolerance, absolute_tolerance)
     grad_threshold = max(grad_max * relative_tolerance, absolute_tolerance)
+    probs_grad_threshold = max(probs_grad_max * relative_tolerance, absolute_tolerance)
 
-    if forward_diff > forward_threshold or grad_diff > grad_threshold:
-        print(f"\n❌ FAIL: Multi-expert set test failed")
+    if forward_diff > forward_threshold:
+        print(f"\n❌ FAIL: Multi-expert set test failed (forward)")
         print(f"   Forward diff: {forward_diff:.6e} > threshold: {forward_threshold:.6e}")
+        return False
+
+    if grad_diff > grad_threshold:
+        print(f"\n❌ FAIL: Multi-expert set test failed (gradient)")
         print(f"   Gradient diff: {grad_diff:.6e} > threshold: {grad_threshold:.6e}")
         return False
 
+    if probs_grad_diff > probs_grad_threshold:
+        print(f"\n❌ FAIL: Multi-expert set test failed (probs gradient)")
+        print(f"   Probs gradient diff: {probs_grad_diff:.6e} > threshold: {probs_grad_threshold:.6e}")
+        return False
+
     print(f"\n✅ PASS: Multi-expert set test passed!")
+    print(f"   Forward diff: {forward_diff:.6e}")
+    print(f"   Gradient diff: {grad_diff:.6e}")
+    print(f"   Probs gradient diff: {probs_grad_diff:.6e}")
     return True
 
 

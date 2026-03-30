@@ -2713,7 +2713,7 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
         set_idx: int,
         global_expert_sets: List[List[List[int]]],
         global_tokens_distribution: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Build send buffer for a specific set_idx.
 
         CRITICAL: This method handles token-expert pairs, NOT unique tokens.
@@ -2735,6 +2735,7 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
             set_send_buffer: [total_send, hidden_size] packed hidden states (one per token-expert pair)
             set_send_probs: [total_send] packed probabilities (one per token-expert pair)
             set_send_reverse_indices: [total_send] original token indices for each entry
+            set_send_expert_ids: [total_send] expert_id for each entry (for probs gradient scatter)
         """
         device = hidden_states.device
         dtype = hidden_states.dtype
@@ -2750,6 +2751,7 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
             return (
                 torch.empty(0, hidden_size, dtype=dtype, device=device),
                 torch.empty(0, dtype=dtype, device=device),
+                torch.empty(0, dtype=torch.long, device=device),
                 torch.empty(0, dtype=torch.long, device=device)
             )
 
@@ -2757,6 +2759,7 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
         set_send_buffer = torch.empty(total_send, hidden_size, dtype=dtype, device=device)
         set_send_probs = torch.empty(total_send, dtype=dtype, device=device)
         set_send_reverse_indices = torch.empty(total_send, dtype=torch.long, device=device)
+        set_send_expert_ids = torch.empty(total_send, dtype=torch.long, device=device)
 
         # Pack tokens per destination rank, iterating through each expert separately
         # This correctly handles tokens routed to multiple experts (one entry per token-expert pair)
@@ -2778,10 +2781,12 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
                     set_send_probs[current_offset:current_offset + num_tokens_for_expert] = probs[expert_indices, exp_id]
                     # Record original token indices for scatter after combine
                     set_send_reverse_indices[current_offset:current_offset + num_tokens_for_expert] = expert_indices
+                    # Record expert_id for each entry (for probs gradient scatter in backward)
+                    set_send_expert_ids[current_offset:current_offset + num_tokens_for_expert] = exp_id
 
                 current_offset += num_tokens_for_expert
 
-        return set_send_buffer, set_send_probs, set_send_reverse_indices
+        return set_send_buffer, set_send_probs, set_send_reverse_indices, set_send_expert_ids
 
     def forward(
         self,
@@ -2872,6 +2877,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         dispatched_tokens_list = []
         dispatched_probs_list = []
         reverse_indices_list = []
+        expert_ids_per_set = []  # For probs gradient scatter in backward
         send_splits_list = []
         recv_splits_list = []
         tokens_per_expert_per_set = []
@@ -2898,7 +2904,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             total_send_0 = sum(send_splits_0)
             total_recv_0 = sum(recv_splits_0)
             # 构建发送buffer，按照发送的rank排布，以及原始的id，用于combine
-            set_send_buffer_0, set_send_probs_0, set_send_reverse_indices_0 = \
+            set_send_buffer_0, set_send_probs_0, set_send_reverse_indices_0, set_send_expert_ids_0 = \
                 self._build_send_buffer_for_set(
                     hidden_states, routing_map, probs,
                     0, global_expert_sets, global_tokens_distribution
@@ -2941,6 +2947,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             current_send_buffer = set_send_buffer_0
             current_send_probs = set_send_probs_0
             current_send_reverse_indices = set_send_reverse_indices_0
+            current_send_expert_ids = set_send_expert_ids_0  # For probs gradient scatter
             current_recv_buffer = set_recv_buffer_0
             current_recv_probs = recv_probs_buffer_0
             current_send_splits = send_splits_0
@@ -2976,7 +2983,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 total_send_next = sum(send_splits_next)
                 total_recv_next = sum(recv_splits_next)
 
-                set_send_buffer_next, set_send_probs_next, set_send_reverse_indices_next = \
+                set_send_buffer_next, set_send_probs_next, set_send_reverse_indices_next, set_send_expert_ids_next = \
                     self._build_send_buffer_for_set(
                         hidden_states, routing_map, probs,
                         next_set_idx, global_expert_sets, global_tokens_distribution
@@ -3138,6 +3145,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             dispatched_tokens_list.append(current_recv_buffer.detach())
             dispatched_probs_list.append(current_recv_probs.detach())
             reverse_indices_list.append(current_send_reverse_indices.detach())
+            expert_ids_per_set.append(current_send_expert_ids.detach())  # For probs gradient scatter
 
             # Record scatter completion for next iteration's DISPATCH
             # This is separate from _compute_events (GEMM done) used by COMBINE
@@ -3151,6 +3159,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 current_send_buffer = set_send_buffer_next
                 current_send_probs = set_send_probs_next
                 current_send_reverse_indices = set_send_reverse_indices_next
+                current_send_expert_ids = set_send_expert_ids_next  # For probs gradient scatter
                 current_recv_buffer = set_recv_buffer_next
                 current_recv_probs = recv_probs_buffer_next
                 current_send_splits = send_splits_next
@@ -3161,7 +3170,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         nvtx.range_pop()
 
         # Save for backward
-        ctx.save_for_backward(*dispatched_tokens_list, *dispatched_probs_list, *reverse_indices_list)
+        ctx.save_for_backward(*dispatched_tokens_list, *dispatched_probs_list, *reverse_indices_list, *expert_ids_per_set)
         ctx.send_splits_list = send_splits_list
         ctx.recv_splits_list = recv_splits_list
         ctx.tokens_per_expert_per_set = tokens_per_expert_per_set
@@ -3187,7 +3196,8 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         num_sets = ctx.num_sets
         dispatched_tensors = ctx.saved_tensors[:num_sets]
         dispatched_probs = ctx.saved_tensors[num_sets:2*num_sets]
-        reverse_indices_list = ctx.saved_tensors[2*num_sets:]
+        reverse_indices_list = ctx.saved_tensors[2*num_sets:3*num_sets]
+        expert_ids_per_set = ctx.saved_tensors[3*num_sets:4*num_sets]  # For probs gradient scatter
 
         device = grad_output.device
         dtype = grad_output.dtype
@@ -3201,6 +3211,10 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
         # Initialize gradient for input tokens
         grad_input = torch.zeros(num_tokens, hidden_size, dtype=dtype, device=device)
+
+        # Initialize gradient for router probs - must match forward input shape [num_tokens, num_global_experts]
+        num_global_experts = ctx.global_tokens_distribution.shape[1]
+        grad_probs_total = torch.zeros(num_tokens, num_global_experts, dtype=dtype, device=device)
 
         current_buffer = 0
         next_buffer = 1
@@ -3219,6 +3233,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
             current_dispatched_tokens = dispatched_tensors[last_set_idx]
             current_dispatched_probs = dispatched_probs[last_set_idx]
             current_reverse_indices = reverse_indices_list[last_set_idx]
+            current_expert_ids = expert_ids_per_set[last_set_idx]  # For probs gradient scatter
             current_tokens_per_expert = tokens_per_expert_per_set[last_set_idx]
             current_send_splits = send_splits_list[last_set_idx]
             current_recv_splits = recv_splits_list[last_set_idx]
@@ -3273,6 +3288,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 prev_dispatched_tokens = dispatched_tensors[prev_set_idx]
                 prev_dispatched_probs = dispatched_probs[prev_set_idx]
                 prev_reverse_indices = reverse_indices_list[prev_set_idx]
+                prev_expert_ids = expert_ids_per_set[prev_set_idx]  # For probs gradient scatter
                 prev_tokens_per_expert = tokens_per_expert_per_set[prev_set_idx]
                 prev_send_splits = send_splits_list[prev_set_idx]
                 prev_recv_splits = recv_splits_list[prev_set_idx]
@@ -3324,6 +3340,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 send_splits = current_send_splits
                 recv_splits = current_recv_splits
                 set_reverse_indices = current_reverse_indices
+                set_expert_ids = current_expert_ids  # For probs gradient scatter
             else:
                 dispatched_tokens = dispatched_tensors[set_idx]
                 dispatched_probs_t = dispatched_probs[set_idx]
@@ -3334,6 +3351,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 send_splits = current_send_splits
                 recv_splits = current_recv_splits
                 set_reverse_indices = current_reverse_indices
+                set_expert_ids = current_expert_ids  # For probs gradient scatter
 
             # Recompute forward with enable_grad
             if total_recv > 0 and num_local_experts > 0:
@@ -3383,13 +3401,15 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 grad_input_local = grads[0] if grads[0] is not None else torch.zeros_like(dispatched_tokens)
                 grad_w1 = grads[1]
                 grad_w2 = grads[2]
+                grad_probs = grads[3]  # Gradient for router probs
 
-                # ==================== REPACK: Convert grad_input_local from expert to source-rank order ====================
-                # grad_input_local is in EXPERT order (from GEMM)
+                # ==================== REPACK: Convert gradients from expert to source-rank order ====================
+                # grad_input_local and grad_probs are in EXPERT order (from GEMM)
                 # REVERSE DISPATCH needs SOURCE-RANK order (send back to original owners)
                 if self.ep_size > 1:
                     nvtx.range_push(f"SET{set_idx}:BW_REPACK_POST")
                     grad_input_for_dispatch = torch.empty_like(grad_input_local)
+                    grad_probs_for_dispatch = torch.empty_like(grad_probs)
                     src_offset = 0
                     expert_offsets = [0] + list(torch.cumsum(tokens_per_expert, 0)[:-1])
 
@@ -3400,15 +3420,19 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                                 # Copy from expert order to source-rank order
                                 grad_input_for_dispatch[src_offset:src_offset + count] = \
                                     grad_input_local[expert_offsets[i]:expert_offsets[i] + count]
+                                grad_probs_for_dispatch[src_offset:src_offset + count] = \
+                                    grad_probs[expert_offsets[i]:expert_offsets[i] + count]
                                 expert_offsets[i] += count
                                 src_offset += count
                     grad_input_local = grad_input_for_dispatch
+                    grad_probs = grad_probs_for_dispatch
                     nvtx.range_pop()
 
                     # Record GEMM/REPACK completion for REVERSE DISPATCH synchronization
                     self._compute_events[current_buffer].record(torch.cuda.current_stream())
             else:
                 grad_input_local = torch.empty(0, hidden_size, dtype=dtype, device=device)
+                grad_probs = torch.empty(0, dtype=dtype, device=device)
                 grad_w1 = None
                 grad_w2 = None
                 # Still need to record event for REVERSE DISPATCH synchronization
@@ -3425,15 +3449,24 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
             # ==================== REVERSE DISPATCH ====================
             # REVERSE DISPATCH sends gradients back to original token owners (source ranks)
-            # Input grad_input_local sorted by SOURCE RANK, input_split_sizes = recv_splits
-            # Output grad_input_remote sorted by DEST RANK, output_split_sizes = send_splits
-            grad_input_remote = torch.empty(total_send, hidden_size, dtype=dtype, device=device)
+            # Combine grad_input_local and grad_probs into a single buffer to reduce communication
+            # grad_input_local: [total_recv, hidden_size]
+            # grad_probs: [total_recv] -> unsqueeze -> [total_recv, 1]
+            if total_recv > 0:
+                concat_grad_local = torch.cat([
+                    grad_input_local,
+                    grad_probs.unsqueeze(-1)
+                ], dim=-1)  # [total_recv, hidden_size + 1]
+            else:
+                concat_grad_local = torch.empty(0, hidden_size + 1, dtype=dtype, device=device)
+
+            concat_grad_remote = torch.empty(total_send, hidden_size + 1, dtype=dtype, device=device)
             if self.ep_size > 1:
                 with torch.cuda.stream(self._comm_stream):
                     self._compute_events[current_buffer].wait(self._comm_stream)
                     nvtx.range_push(f"SET{set_idx}:REV_DISPATCH")
                     torch.distributed.all_to_all_single(
-                        grad_input_remote, grad_input_local,
+                        concat_grad_remote, concat_grad_local,
                         output_split_sizes=send_splits,   # To each dest rank
                         input_split_sizes=recv_splits,    # From each source rank
                         group=self.ep_group
@@ -3442,12 +3475,27 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                     self._comm_events[current_buffer].record(self._comm_stream)
                 torch.cuda.current_stream().wait_stream(self._comm_stream)
             else:
-                grad_input_remote = grad_input_local
+                concat_grad_remote = concat_grad_local
+
+            # Split the combined gradient back into hidden_states and probs gradients
+            if total_send > 0:
+                grad_input_remote = concat_grad_remote[:, :-1]  # [total_send, hidden_size]
+                grad_probs_remote = concat_grad_remote[:, -1]    # [total_send]
+            else:
+                grad_input_remote = torch.empty(0, hidden_size, dtype=dtype, device=device)
+                grad_probs_remote = torch.empty(0, dtype=dtype, device=device)
 
             # Scatter gradients back to original token positions
             if set_reverse_indices.numel() > 0 and grad_input_remote.numel() > 0:
                 nvtx.range_push(f"SET{set_idx}:BW_SCATTER")
                 grad_input.index_add_(0, set_reverse_indices, grad_input_remote)
+                # Scatter probs gradients to correct [token_idx, expert_id] positions
+                # Using index_put_ with accumulate=True for correct 2D indexing
+                grad_probs_total.index_put_(
+                    (set_reverse_indices, set_expert_ids),
+                    grad_probs_remote,
+                    accumulate=True
+                )
                 nvtx.range_pop()
 
             # Record scatter completion for next iteration
@@ -3462,6 +3510,7 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                 current_dispatched_tokens = prev_dispatched_tokens
                 current_dispatched_probs = prev_dispatched_probs
                 current_reverse_indices = prev_reverse_indices
+                current_expert_ids = prev_expert_ids  # For probs gradient scatter
                 current_tokens_per_expert = prev_tokens_per_expert
                 current_send_splits = prev_send_splits
                 current_recv_splits = prev_recv_splits
@@ -3471,4 +3520,4 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
 
         nvtx.range_pop()
 
-        return None, grad_input, None, None, None
+        return None, grad_input, None, grad_probs_total, None
