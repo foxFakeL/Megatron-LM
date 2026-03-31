@@ -1357,6 +1357,11 @@ class PerSetActivationCache:
         """Get the CPU buffer for a specific set."""
         return self._cpu_buffers.get(set_idx)
 
+    def clear_set(self, set_idx: int) -> None:
+        """Clear the CPU buffer for a specific set after it's been used."""
+        if set_idx in self._cpu_buffers:
+            del self._cpu_buffers[set_idx]
+
     def clear(self) -> None:
         """Clear all cached activations."""
         self._cpu_buffers.clear()
@@ -3666,6 +3671,13 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
                     accumulate=True
                 )
                 nvtx.range_pop()
+
+            # Clear CPU and GPU activation buffers for this set (no longer needed)
+            if activation_offloaded:
+                # Clear CPU buffer for this set
+                self._per_set_activation_cache.clear_set(set_idx)
+                # Clear GPU buffer reference (will be reused/overwritten in next iteration)
+                activation_gpu_buffers[current_buffer] = None
 
             # Record scatter completion for next iteration
             # This is separate from _compute_events (GEMM done) used by REVERSE DISPATCH
