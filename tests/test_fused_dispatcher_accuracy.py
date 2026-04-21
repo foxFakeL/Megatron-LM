@@ -397,7 +397,7 @@ def test_single_gpu_accuracy():
     print(f"Loss diff: {loss_diff:.6e}")
 
     # Gradient comparison
-    grad_diff = (grad_input_fused - grad_input_ref).abs()
+    grad_diff = (grad_input_fused - d).abs()
     grad_max_diff = grad_diff.max().item()
     grad_mean_diff = grad_diff.mean().item()
 

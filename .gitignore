@@ -25,3 +25,4 @@ docs/apidocs
 *.nsys-rep
 *.sqlite
 *.log
+.claude

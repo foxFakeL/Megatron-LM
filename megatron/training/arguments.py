@@ -371,7 +371,9 @@ def tuple_type(x):
     assert isinstance(x, str)
     return tuple(int(i) for i in x.strip('()').split(','))
 
-def validate_args(args, defaults={}):
+def validate_args(args, defaults=None):
+    if defaults is None:
+        defaults = {}
 
     # Temporary
     assert args.non_persistent_ckpt_type in ['global', 'local', None], \

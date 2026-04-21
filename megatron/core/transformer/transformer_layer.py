@@ -566,6 +566,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        # Ensure hidden_states is bfloat16 for TransformerEngine compatibility
+        # This fixes dtype mismatch when embedding outputs float32
+        if hasattr(self, 'config') and getattr(self.config, 'bf16', False):
+            if hidden_states.dtype != torch.bfloat16:
+                hidden_states = hidden_states.to(torch.bfloat16)
+
         # Optional Input Layer norm
         if self.recompute_input_layernorm:
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -661,6 +667,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
             FineGrainedActivationOffloadingInterface as off_interface,
         )
+
+        # Ensure hidden_states has the same dtype as layernorm weight
+        # This fixes potential dtype mismatch from attention layers (especially with TransformerEngine)
+        if hasattr(self.pre_mlp_layernorm, 'weight') and hidden_states.dtype != self.pre_mlp_layernorm.weight.dtype:
+            hidden_states = hidden_states.to(self.pre_mlp_layernorm.weight.dtype)
 
         if self.recompute_pre_mlp_layernorm:
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()

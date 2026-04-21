@@ -775,6 +775,10 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         # Final layer norm.
         if self.final_layernorm is not None:
+            # Ensure hidden_states has the same dtype as layernorm weight
+            # This fixes potential dtype mismatch from MoE layers
+            if hasattr(self.final_layernorm, 'weight') and hidden_states.dtype != self.final_layernorm.weight.dtype:
+                hidden_states = hidden_states.to(self.final_layernorm.weight.dtype)
             hidden_states = self.final_layernorm(hidden_states)
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is

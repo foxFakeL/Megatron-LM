@@ -37,7 +37,8 @@ from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.moe.experts import FusedDispatcherCacheGroupedMLP
-
+from megatron.core.optimizer.deepspeed_cpu_offload_optimizer import DeepSpeedCPUOffloadOptimizer
+import torch.cuda.profiler as profiler
 try:
     from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TERowParallelLinear
     HAVE_TE = True
@@ -50,6 +51,14 @@ try:
     HAVE_TE_MODULE = True
 except ImportError:
     HAVE_TE_MODULE = False
+
+# Flash Attention 2 support
+try:
+    from flash_attn import flash_attn_func, flash_attn_varlen_func
+    from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
+    HAVE_FLASH_ATTN = True
+except ImportError:
+    HAVE_FLASH_ATTN = False
 
 
 def _init_distributed() -> Tuple[int, int, int]:
@@ -144,7 +153,10 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
 
 
 class Qwen3Attention(nn.Module):
-    """Multi-headed attention with GQA support for Qwen3MoE."""
+    """Multi-headed attention with GQA support for Qwen3MoE.
+
+    Supports Flash Attention 2 for efficient memory usage and faster computation.
+    """
 
     def __init__(self, config: TransformerConfig, layer_idx: int):
         super().__init__()
@@ -153,16 +165,34 @@ class Qwen3Attention(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
-        self.num_key_value_heads = getattr(config, 'num_key_value_heads', self.num_heads)
+        self.num_key_value_heads = getattr(config, 'num_query_groups', self.num_heads)
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = getattr(config, 'max_position_embeddings', 4096)
         self.rope_theta = getattr(config, 'rope_theta', 1000000.0)
 
-        # QKV projections
-        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        # QKV projections - 直接在 GPU 上创建空 tensor，然后初始化
+        # 这样避免了 CPU 初始化 + CPU→GPU 传输
+        device = torch.device("cuda")
+        # 使用 config.params_dtype 作为权重数据类型
+        dtype = config.params_dtype
+
+        # 固定随机种子
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+        init_std = 0.02
+
+        # 创建空 tensor 在 GPU 上，然后初始化
+        self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False, device=device, dtype=dtype)
+        self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, device=device, dtype=dtype)
+        self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False, device=device, dtype=dtype)
+        self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False, device=device, dtype=dtype)
+
+        # 初始化权重 (GPU 上快速初始化)
+        with torch.no_grad():
+            nn.init.normal_(self.q_proj.weight, mean=0.0, std=init_std)
+            nn.init.normal_(self.k_proj.weight, mean=0.0, std=init_std)
+            nn.init.normal_(self.v_proj.weight, mean=0.0, std=init_std)
+            nn.init.normal_(self.o_proj.weight, mean=0.0, std=init_std)
 
         # Rotary embedding
         self.rotary_emb = RotaryEmbedding(
@@ -170,6 +200,78 @@ class Qwen3Attention(nn.Module):
             max_position_embeddings=self.max_position_embeddings,
             base=self.rope_theta,
         )
+
+        # Flash Attention 2 support
+        self.use_flash_attn = HAVE_FLASH_ATTN and self.head_dim <= 256
+
+    def _flash_attn_forward(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Flash Attention 2 forward pass.
+
+        Args:
+            query_states: [batch, seq_len, num_heads, head_dim]
+            key_states: [batch, seq_len, num_kv_heads, head_dim]
+            value_states: [batch, seq_len, num_kv_heads, head_dim]
+
+        Returns:
+            output: [batch, seq_len, num_heads, head_dim]
+        """
+        # Flash Attention 2 expects [batch, seq_len, num_heads, head_dim]
+        # It supports GQA natively (num_heads != num_kv_heads)
+        attn_output = flash_attn_func(
+            query_states,
+            key_states,
+            value_states,
+            causal=True,  # Causal mask
+            softmax_scale=1.0 / math.sqrt(self.head_dim),
+        )
+        return attn_output
+
+    def _standard_forward(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+    ) -> torch.Tensor:
+        """Standard attention forward pass (fallback).
+
+        Args:
+            query_states: [batch, seq_len, num_heads, head_dim]
+            key_states: [batch, seq_len, num_kv_heads, head_dim]
+            value_states: [batch, seq_len, num_kv_heads, head_dim]
+
+        Returns:
+            output: [batch, seq_len, num_heads, head_dim]
+        """
+        seq_len = query_states.shape[1]
+
+        # Transpose for attention: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
+        query_states = query_states.transpose(1, 2)
+        key_states = key_states.transpose(1, 2)
+        value_states = value_states.transpose(1, 2)
+
+        # Repeat k/v heads if num_key_value_heads < num_heads (GQA)
+        if self.num_key_value_groups > 1:
+            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
+            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+
+        # Attention
+        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
+
+        # Causal mask (lower triangular)
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=query_states.device), diagonal=1).bool()
+        attn_weights = attn_weights.masked_fill(causal_mask[None, None, :, :], float('-inf'))
+
+        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+        attn_output = torch.matmul(attn_weights, value_states)
+
+        # Reshape back: [batch, heads, seq, head_dim] -> [batch, seq, heads, head_dim]
+        attn_output = attn_output.transpose(1, 2)
+        return attn_output
 
     def forward(
         self,
@@ -184,41 +286,32 @@ class Qwen3Attention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
-        # Reshape for attention
+        # Reshape for attention: [batch, seq_len, num_heads, head_dim]
         query_states = query_states.view(batch_size, seq_len, self.num_heads, self.head_dim)
         key_states = key_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
 
-        # Transpose for attention: [batch, seq, heads, head_dim] -> [batch, heads, seq, head_dim]
-        query_states = query_states.transpose(1, 2)
-        key_states = key_states.transpose(1, 2)
-        value_states = value_states.transpose(1, 2)
+        # Apply rotary embedding (before flash attention)
+        # Need to transpose for rotary embedding
+        query_states_t = query_states.transpose(1, 2)  # [batch, heads, seq, head_dim]
+        key_states_t = key_states.transpose(1, 2)
+        value_states_t = value_states.transpose(1, 2)
 
-        # Apply rotary embedding
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        cos, sin = self.rotary_emb(value_states_t, position_ids)
+        query_states_t, key_states_t = apply_rotary_pos_emb(query_states_t, key_states_t, cos, sin)
 
-        # Repeat k/v heads if num_key_value_heads < num_heads (GQA)
-        if self.num_key_value_groups > 1:
-            key_states = key_states.repeat_interleave(self.num_key_value_groups, dim=1)
-            value_states = value_states.repeat_interleave(self.num_key_value_groups, dim=1)
+        # Transpose back for flash attention: [batch, seq, heads, head_dim]
+        query_states = query_states_t.transpose(1, 2)
+        key_states = key_states_t.transpose(1, 2)
+        value_states = value_states_t.transpose(1, 2)
 
-        # Attention
-        attn_weights = torch.matmul(query_states, key_states.transpose(-2, -1)) / math.sqrt(self.head_dim)
-
-        # Apply causal mask
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        # Causal mask (lower triangular)
-        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=hidden_states.device), diagonal=1).bool()
-        attn_weights = attn_weights.masked_fill(causal_mask[None, None, :, :], float('-inf'))
-
-        attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_output = torch.matmul(attn_weights, value_states)
+        # Choose attention implementation
+        if self.use_flash_attn:
+            attn_output = self._flash_attn_forward(query_states, key_states, value_states)
+        else:
+            attn_output = self._standard_forward(query_states, key_states, value_states)
 
         # Reshape back
-        attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
 
         # Output projection
@@ -360,8 +453,11 @@ class Qwen3MoEModel(nn.Module):
         super().__init__()
         self.config = config
 
-        # Token embedding
-        self.embed_tokens = nn.Embedding(vocab_size, config.hidden_size)
+        device = torch.device("cuda")
+        dtype = config.params_dtype  # 使用 config 中配置的数据类型
+
+        # Token embedding - 直接在 GPU 上创建
+        self.embed_tokens = nn.Embedding(vocab_size, config.hidden_size, device=device, dtype=dtype)
 
         # Transformer layers
         self.layers = nn.ModuleList([
@@ -373,7 +469,7 @@ class Qwen3MoEModel(nn.Module):
         self.norm = RMSNorm(config.hidden_size, eps=getattr(config, 'layernorm_epsilon', 1e-6))
 
         # Output projection (tied with embedding)
-        self.lm_head = nn.Linear(config.hidden_size, vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.hidden_size, vocab_size, bias=False, device=device, dtype=dtype)
 
         # Tie weights
         self.lm_head.weight = self.embed_tokens.weight
@@ -542,7 +638,7 @@ def main():
         experts_per_set=args.experts_per_set,
     )
 
-    # Create model
+    # Create model (参数已在 GPU 上创建和初始化)
     model = Qwen3MoEModel(
         config=config,
         pg_collection=pg_collection,
@@ -550,28 +646,36 @@ def main():
         vocab_size=args.vocab_size,
     )
 
-    if config.bf16:
-        model = model.bfloat16()
-
     model.train()
 
-    # Move non-expert parameters to GPU, keep expert weights on CPU
-    # This is critical for FusedDispatcherCacheGroupedMLP which stores weights in CPU shared memory
-    device = torch.device("cuda")
-    for name, param in model.named_parameters():
-        if 'experts.weight1' not in name and 'experts.weight2' not in name:
-            param.data = param.data.to(device)
+    # 初始化 embedding 权重 (GPU 上快速初始化)
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    init_std = 0.02
+    with torch.no_grad():
+        nn.init.normal_(model.embed_tokens.weight, mean=0.0, std=init_std)
+        # lm_head.weight 与 embed_tokens.weight 共享，无需单独初始化
 
-    # Move buffers to GPU as well (e.g., rotary embedding inv_freq)
+    # Move all non-expert params and buffers to GPU with correct dtype
+    device = torch.device("cuda")
+    dtype = config.params_dtype
+    for name, param in model.named_parameters():
+        if 'experts.weight' not in name:
+            param.data = param.data.to(device=device, dtype=dtype)
     for name, buffer in model.named_buffers():
         if buffer is not None:
-            buffer.data = buffer.data.to(device)
+            buffer.data = buffer.data.to(device=device, dtype=dtype)
 
-    # Create optimizer (only optimize non-expert params here, expert params are handled separately)
-    # For simplicity, we include all params - gradients for expert weights will be on CPU
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=args.lr
+    # Create DeepSpeedCPUOffloadOptimizer
+    # - GPU params (attention, embedding, router): standard AdamW on GPU
+    # - Expert params: DeepSpeed CPUAdam on CPU
+    # - Expert weights/gradients already on CPU (shared memory)
+    optimizer = DeepSpeedCPUOffloadOptimizer(
+        model=model,
+        lr=args.lr,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+        weight_decay=0.01,
     )
 
     batch_size = args.micro_batch_size
@@ -599,6 +703,7 @@ def main():
             print(f"  Seq length: {seq_len}")
             print(f"  Num iterations: {args.iters}")
             print(f"  Activation offload: {args.activation_offload}")
+            print(f"  Flash Attention 2: {'enabled' if HAVE_FLASH_ATTN else 'disabled (not available)'}")
             print(f"  Dtype: {'bf16' if config.bf16 else 'fp32'}")
             print("=" * 60)
 
@@ -607,6 +712,17 @@ def main():
         total_optimizer_time = 0.0
 
         for it in range(args.iters):
+            if it == 1: # 跳过第 0 步（预热），从第 1 步开始录制
+                print(">>> Nsys profiling started")
+                profiler.start()
+            
+            # ... 原有的训练逻辑 (forward, backward, optimizer step) ...
+            
+            if it == 2: # 录制完第 1、2 步后停止（即总共两个有效 step）
+                profiler.start()
+                print(">>> Nsys profiling stopped")
+                # 如果只想 profile 前两个 step 就退出，可以直接：
+                sys.exit(0)
             optimizer.zero_grad(set_to_none=True)
 
             # Generate mock data
@@ -622,17 +738,17 @@ def main():
             total_forward_time += forward_time
 
             # Backward pass
+            # Note: Expert gradients are already offloaded to CPU during backward
+            # Optimizer states are prefetched during backward via callback
             t0 = time.time()
             loss.backward()
-
-            # Sync gradients for MoE experts
-            model.sync_gradients()
-
             torch.cuda.synchronize()
             backward_time = time.time() - t0
             total_backward_time += backward_time
 
-            # Optimizer step
+            # Optimizer step - update both GPU params and expert params
+            # GPU params: attention, embedding, router - updated on GPU
+            # Expert params: DeepSpeed CPUAdam on CPU
             t0 = time.time()
             optimizer.step()
             torch.cuda.synchronize()

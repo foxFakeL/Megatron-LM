@@ -32,7 +32,7 @@ class FallbackOps:
 
 def grouped_gemm_is_available():
     """Check if grouped_gemm is available."""
-    return grouped_gemm is not None
+    return grouped_gemm is not None and hasattr(grouped_gemm, 'ops')
 
 
 def assert_grouped_gemm_is_available():
