@@ -35,6 +35,7 @@ try:
     HAVE_TE = True
 except ImportError:
     HAVE_TE = False
+    te_general_gemm = None
 
 
 # MOE logging
