@@ -133,7 +133,6 @@ class Qwen3MoEQuantizedMLPLayer(torch.nn.Module):
             probs_flat,
             self.expert_sets,
         )
-        # print(f"[DEBUG MoE] output.dtype={output.dtype}, expected bf16")
         log_memory("Qwen3MoEQuantizedMLPLayer: after experts")
 
         # Reshape back to [s, b, h]
@@ -178,12 +177,7 @@ class Qwen3MoEQuantizedModel(LanguageModule):
         quant_group_size: int = 128,
         lr_quant: float = 1e-4,
     ):
-        import time
-        _model_start_time = time.time()
-        _debug_print = lambda msg: print(f"[DEBUG Model {time.time()-_model_start_time:.2f}s] {msg}")
-
         super().__init__(config=config)
-        _debug_print("LanguageModule.__init__ done")
 
         self.config = config
         self.transformer_layer_spec = transformer_layer_spec
@@ -203,7 +197,6 @@ class Qwen3MoEQuantizedModel(LanguageModule):
         if pg_collection is None:
             pg_collection = get_default_pg_collection()
         self.pg_collection = pg_collection
-        _debug_print("Process groups setup done")
 
         # Calculate expert sets for this rank
         ep_size = parallel_state.get_expert_model_parallel_world_size()
@@ -236,7 +229,6 @@ class Qwen3MoEQuantizedModel(LanguageModule):
                 max_sequence_length=self.max_sequence_length,
                 position_embedding_type='none',
             )
-            _debug_print("Embedding layer created")
             log_memory("Qwen3MoEQuantizedModel.__init__: after embedding")
 
         # RoPE
@@ -252,7 +244,6 @@ class Qwen3MoEQuantizedModel(LanguageModule):
             self.rotary_pos_emb = None
 
         # Transformer blocks
-        _debug_print("Creating TransformerBlock...")
         self.decoder = TransformerBlock(
             config=self.config,
             spec=transformer_layer_spec,
@@ -260,7 +251,6 @@ class Qwen3MoEQuantizedModel(LanguageModule):
             pre_process=self.pre_process,
             post_process=self.post_process,
         )
-        _debug_print("TransformerBlock created")
         log_memory("Qwen3MoEQuantizedModel.__init__: after decoder")
 
         # Output layer
@@ -276,7 +266,6 @@ class Qwen3MoEQuantizedModel(LanguageModule):
                 skip_weight_param_allocation=self.share_embeddings_and_output_weights,
                 tp_group=self.pg_collection.tp,
             )
-            _debug_print("Output layer created")
 
             if HAS_LIGER:
                 self.liger_loss_fn = LigerCrossEntropyLoss(softcap=30.0)
@@ -285,12 +274,9 @@ class Qwen3MoEQuantizedModel(LanguageModule):
 
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
-            _debug_print("setup_embeddings_and_output_layer done")
 
         # Replace MLP layers with quantized MoE layers
-        _debug_print("Replacing MLP with quantized MoE...")
         self._replace_mlp_with_quantized_moe()
-        _debug_print("MoE replacement done")
 
         if parallel_state.get_expert_model_parallel_rank() == 0:
             print(f"[Qwen3MoEQuantized] EP={ep_size}, experts_per_rank={experts_per_rank}, "
@@ -317,16 +303,33 @@ class Qwen3MoEQuantizedModel(LanguageModule):
         self.decoder.set_input_tensor(input_tensor)
 
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
-        """Memory-efficient cross entropy using Liger Kernel."""
+        """Memory-efficient cross entropy using Liger Kernel.
+
+        Args:
+            labels: [batch, seq_len] labels (already shifted, last position = -100)
+            logits: [seq, batch, vocab] logits (Megatron format)
+
+        Returns:
+            loss: Scalar mean loss over non-ignored positions
+        """
         if self.liger_loss_fn is not None:
-            # Liger expects [batch, seq, vocab], transpose logits
-            logits_t = logits.transpose(0, 1).contiguous()
-            loss = self.liger_loss_fn(logits_t, labels)
+            vocab_size = logits.shape[-1]
+
+            # logits is [s, b, v], view as [s*b, v] - no copy, just reshape
+            logits_flat = logits.view(-1, vocab_size)
+
+            # Transpose labels from [b, s] to [s, b] then flatten
+            labels_flat = labels.T.contiguous().view(-1)
+
+            # Liger returns scalar mean loss (reduction='mean' by default)
+            loss = self.liger_loss_fn(logits_flat, labels_flat)
             return loss
         else:
             # Standard cross entropy
-            logits_flat = logits.view(-1, self.vocab_size)
-            labels_flat = labels.view(-1)
+            vocab_size = logits.shape[-1]
+            logits_flat = logits.view(-1, vocab_size)
+            # Transpose labels from [b, s] to [s, b] then flatten
+            labels_flat = labels.T.contiguous().view(-1)
             loss = torch.nn.functional.cross_entropy(
                 logits_flat, labels_flat, ignore_index=-100
             )
@@ -354,14 +357,12 @@ class Qwen3MoEQuantizedModel(LanguageModule):
             rotary_pos_emb = None
 
         # Transformer decoder
-        # print(f"[DEBUG model] before decoder: hidden_states.dtype={hidden_states.dtype}")
         hidden_states = self.decoder(
             hidden_states,
             attention_mask=attention_mask,
             inference_params=inference_params,
             rotary_pos_emb=rotary_pos_emb,
         )
-        # print(f"[DEBUG model] after decoder: hidden_states.dtype={hidden_states.dtype}")
 
         # Output layer
         if self.post_process:
@@ -402,10 +403,11 @@ def model_provider(
     experts_per_set = getattr(args, 'experts_per_set', 16)
     rotary_base = getattr(args, 'rope_theta', 1000000)
 
-    # Get block spec (use local backend since quantization is custom)
+    # Get block spec - use TE for attention (Flash Attention), local for quantized MoE
+    use_te = getattr(config, 'transformer_impl', 'local') == 'transformer_engine'
     transformer_layer_spec = get_qwen3_moe_block_spec(
         num_layers=args.num_layers,
-        use_te=False,  # Force local backend for quantized model
+        use_te=use_te,  # Enable TransformerEngine for Flash Attention
         num_experts=num_experts,
         experts_per_set=experts_per_set,
     )

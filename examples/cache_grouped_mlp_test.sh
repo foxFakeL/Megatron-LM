@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export PYTHONPATH=/cnic/work/liuql/Megatron-LM
+export PYTHONPATH=/data/home/scwb466/run/liuql/Megatron-LM
 export PYTHONPATH=/cnic/work/liuql/flash-attention/hopper:$PYTHONPATH
 export NVTE_FLASH_ATTN_2=1
 # Example launcher for examples/cache_grouped_mlp_test.py
@@ -26,7 +26,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${NNODES:=1}"
 : "${NPROC_PER_NODE:=1}"
 : "${ENABLE_NSYS:=1}"
-: "${NSYS_OUT:=/cnic/work/liuql/Megatron-LM/nsys_cache_grouped_mlp}"
+: "${NSYS_OUT:=/data/home/scwb466/run/liuql/nsys_cache_grouped_mlp}"
 : "${ACTIVATION_OFFLOAD:=1}"
 : "${NUM_LAYERS:=1}"
 : "${BATCH_SIZE:=1}"
@@ -51,6 +51,7 @@ fi
 ${NSYS_CMD[@]} torchrun \
   --nnodes "${NNODES}" \
   --nproc_per_node "${NPROC_PER_NODE}" \
+  --master_port "${MASTER_PORT:-29500}" \
   "${SCRIPT_DIR}/cache_grouped_mlp_test.py" \
   --iters 12 \
   --test-mode "${TEST_MODE}" \

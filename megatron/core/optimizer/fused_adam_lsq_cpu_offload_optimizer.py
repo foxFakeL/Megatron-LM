@@ -139,11 +139,6 @@ class GlobalQuantizationPool:
         self.num_groups_w1 = num_groups_w1
         self.num_groups_w2 = num_groups_w2
 
-        print(f"[DEBUG GlobalQuantizationPool.__init__] num_total_experts={self.num_total_experts}, "
-              f"w1_numel={w1_numel}, w2_numel={w2_numel}, "
-              f"num_groups_w1={num_groups_w1}, num_groups_w2={num_groups_w2}, "
-              f"num_int8_slots={self.num_int8_slots}, num_int4_slots={self.num_int4_slots}")
-
         # Delta/Z buffers - 所有专家持有, 用于存储GPU计算的delta/z
         # 用float32保存, 不区分INT8/INT4精度
         self.delta_w1 = torch.empty(
@@ -464,10 +459,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             lr_quant: Learning rate for delta/z updates (used by GPU)
             initial_precision: Initial precision for all experts (16/8/4)
         """
-        import time
-        self._debug_start_time = time.time()
-        self._debug_print = lambda msg: print(f"[DEBUG Init {time.time()-self._debug_start_time:.2f}s] {msg}")
-
         self.base_lr = lr
         self.lr = lr
         self.betas = betas
@@ -490,7 +481,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
         self.gpu_params: List[nn.Parameter] = []
         self.expert_modules: List[QuantizedDispatcherCacheGroupedMLP] = []
         self._collect_parameters(model)
-        self._debug_print("_collect_parameters done")
 
         # Get expert count from first module
         if self.expert_modules:
@@ -511,7 +501,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
         self._ep_group = parallel_state.get_expert_model_parallel_group()
         self._ep_size = dist.get_world_size(self._ep_group) if dist.is_initialized() else 1
         self._ep_rank = dist.get_rank(self._ep_group) if dist.is_initialized() else 0
-        self._debug_print(f"EP group setup done: ep_size={self._ep_size}, ep_rank={self._ep_rank}")
 
         # Standard AdamW for GPU parameters
         if self.gpu_params:
@@ -524,7 +513,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             )
         else:
             self.gpu_optimizer = None
-        self._debug_print(f"GPU optimizer created: {len(self.gpu_params)} GPU params")
 
         # === Global Quantization Pool ===
         # All layers share a single quantization pool
@@ -555,7 +543,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             int4_ratio=1.0 - top_bf16_ratio - top_int8_ratio,
             quant_group_size=quant_group_size,
         )
-        self._debug_print(f"GlobalQuantizationPool created: {self.num_layers} layers, {self.num_experts_per_layer} experts/layer")
 
         # Expert scores for dynamic precision allocation (global_expert_id -> score)
         self._expert_scores: Dict[int, float] = {}
@@ -565,7 +552,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
 
         # Initialize all experts: attach to pool with initial precision
         self._init_quantization_pool()
-        self._debug_print("_init_quantization_pool done")
 
         # Create main weight storage and Parameters for FusedAdamLSQ
         # QuantizedDispatcher doesn't have weight1/weight2, so optimizer manages them
@@ -574,13 +560,39 @@ class FusedAdamLSQCPUOffloadOptimizer:
         self._per_expert_weight_params: Dict[int, Tuple[nn.Parameter, nn.Parameter]] = {}  # global_expert_id -> (w1_param, w2_param)
         # Keep references to shared memory objects to prevent GC from releasing them
         self._shm_objects: Dict[str, shm.SharedMemory] = {}  # shm_name -> SharedMemory
-        self._debug_print("Starting _init_main_weight_storage...")
         self._init_main_weight_storage()
-        self._debug_print("_init_main_weight_storage done")
+
 
         # FusedAdamLSQ for expert parameters - ONLY rank 0 creates it
         expert_params = list(self._per_expert_weight_params.values())  # Flatten to list of params
         expert_params = [p for pair in expert_params for p in pair]  # (w1, w2) pairs -> flat list
+
+
+        # CRITICAL: JIT compilation strategy for distributed environment
+        # Only Rank 0 compiles, other ranks wait and load from cache
+        # Multiple processes calling torch.utils.cpp_extension.load() simultaneously
+        # causes deadlock due to file lock contention on cache directory
+        if HAVE_FUSED_ADAM_LSQ:
+            if self._ep_rank == 0:
+                # Rank 0: Perform JIT compilation
+                from fused_adam_lsq.op_builder import FusedAdamLSQBuilder
+                try:
+                    _jit_module = FusedAdamLSQBuilder().load()
+                except Exception as e:
+                    raise
+
+            # Barrier: Wait for Rank 0 to complete compilation
+            if self._ep_size > 1:
+                dist.barrier(group=self._ep_group)
+
+            if self._ep_rank != 0:
+                # Other ranks: Load from cache (should be fast now)
+                from fused_adam_lsq.op_builder import FusedAdamLSQBuilder
+                try:
+                    _jit_module = FusedAdamLSQBuilder().load()
+                except Exception as e:
+                    raise
+
         if expert_params and self._ep_rank == 0:
             if HAVE_FUSED_ADAM_LSQ:
                 # Create FusedAdamLSQ with default q_bits=8
@@ -596,14 +608,18 @@ class FusedAdamLSQCPUOffloadOptimizer:
                     group_size=quant_group_size,
                     q_bits=8,  # Default q_bits, per-param will override
                 )
-                self._debug_print(f"FusedAdamLSQ created: {len(expert_params)} expert params")
             else:
                 raise ImportError(
                     "FusedAdamLSQ not available. Please install fuse_opt package."
                 )
         else:
             self.cpu_optimizer = None
-        self._debug_print("FusedAdamLSQ setup complete")
+
+
+        # CRITICAL: Barrier to ensure all ranks complete optimizer init before returning
+        # This prevents one rank from starting train() while another is still initializing
+        if self._ep_size > 1:
+            dist.barrier(group=self._ep_group)
 
         # Threading support for async CPU-GPU optimizer overlap
         self._cpu_step_done_event = threading.Event()
@@ -614,6 +630,7 @@ class FusedAdamLSQCPUOffloadOptimizer:
         # Pass CPU update event to expert modules
         for module in self.expert_modules:
             module.set_cpu_update_event(self._cpu_update_done_event)
+
 
     def _collect_parameters(self, model: nn.Module):
         """Collect and separate GPU params from expert params.
@@ -687,7 +704,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
         base_rank = min(ep_ranks) if ep_ranks else 0
         is_rank_0 = (self._ep_rank == 0)
 
-        self._debug_print(f"_init_main_weight_storage: num_layers={self.num_layers}, experts_per_layer={self.num_experts_per_layer}")
 
         for layer_id in range(self.num_layers):
             layer_start = time.time()
@@ -697,7 +713,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             # Weight1 shared memory
             shm_name_w1 = f"megatron_quant_w1{shm_suffix}"
             size_w1 = self.num_experts_per_layer * hidden_size * fc1_out_features * dtype.itemsize
-            self._debug_print(f"  Layer {layer_id}: Creating w1 shm (size={size_w1/1e6:.1f}MB)")
 
             if is_rank_0:
                 try:
@@ -713,7 +728,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
                 dist.barrier(group=self._ep_group) if dist.is_initialized() else None
                 shm_w1 = shm.SharedMemory(name=shm_name_w1)
                 self._shm_objects[shm_name_w1] = shm_w1  # Keep reference to prevent GC
-            self._debug_print(f"  Layer {layer_id}: w1 shm ready ({time.time()-layer_start:.2f}s)")
 
             w1_data = torch.frombuffer(shm_w1.buf, dtype=dtype).view(
                 self.num_experts_per_layer, hidden_size, fc1_out_features
@@ -722,7 +736,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             # Weight2 shared memory
             shm_name_w2 = f"megatron_quant_w2{shm_suffix}"
             size_w2 = self.num_experts_per_layer * ffn_hidden_size * hidden_size * dtype.itemsize
-            self._debug_print(f"  Layer {layer_id}: Creating w2 shm (size={size_w2/1e6:.1f}MB)")
 
             if is_rank_0:
                 try:
@@ -738,7 +751,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
                 dist.barrier(group=self._ep_group) if dist.is_initialized() else None
                 shm_w2 = shm.SharedMemory(name=shm_name_w2)
                 self._shm_objects[shm_name_w2] = shm_w2  # Keep reference to prevent GC
-            self._debug_print(f"  Layer {layer_id}: w2 shm ready ({time.time()-layer_start:.2f}s)")
 
             w2_data = torch.frombuffer(shm_w2.buf, dtype=dtype).view(
                 self.num_experts_per_layer, ffn_hidden_size, hidden_size
@@ -749,7 +761,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
                 init_start = time.time()
                 torch.manual_seed(42)
                 device = torch.cuda.current_device()
-                self._debug_print(f"  Layer {layer_id}: Allocating GPU tensors...")
                 # Initialize all experts on GPU at once (much faster than chunked)
                 # Single large allocation instead of many small ones
                 temp_w1_gpu = torch.empty(
@@ -760,27 +771,22 @@ class FusedAdamLSQCPUOffloadOptimizer:
                     self.num_experts_per_layer, ffn_hidden_size, hidden_size,
                     dtype=dtype, device=device
                 )
-                self._debug_print(f"  Layer {layer_id}: Applying init_method...")
                 # Apply init methods
                 self.expert_modules[0].config.init_method(temp_w1_gpu)
                 self.expert_modules[0].config.output_layer_init_method(temp_w2_gpu)
-                self._debug_print(f"  Layer {layer_id}: Copying to CPU...")
                 # Single copy to CPU
                 w1_data.copy_(temp_w1_gpu.cpu())
                 w2_data.copy_(temp_w2_gpu.cpu())
                 del temp_w1_gpu, temp_w2_gpu
-                self._debug_print(f"  Layer {layer_id}: GPU init done ({time.time()-init_start:.2f}s)")
                 # Barrier after initialization complete
                 dist.barrier(group=self._ep_group) if dist.is_initialized() else None
             else:
                 # Wait for rank 0 to finish initialization
                 dist.barrier(group=self._ep_group) if dist.is_initialized() else None
-            self._debug_print(f"  Layer {layer_id}: After init barrier ({time.time()-layer_start:.2f}s)")
 
             # Pin shared memory for async transfers
             pin_existing_tensor(w1_data)
             pin_existing_tensor(w2_data)
-            self._debug_print(f"  Layer {layer_id}: Pinned memory ({time.time()-layer_start:.2f}s)")
 
             # Create per-expert Parameter objects for FusedAdamLSQ
             # Each expert has its own Parameter for fine-grained precision control
@@ -795,7 +801,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
                 # Store tensor references for each expert
                 self._main_weight_storage[global_expert_id] = (w1_data[local_exp_id], w2_data[local_exp_id])
 
-            self._debug_print(f"  Layer {layer_id}: Created {self.num_experts_per_layer} expert params ({time.time()-layer_start:.2f}s)")
 
     def update_call_frequency(self, tokens_per_expert: torch.Tensor, layer_id: int = 0):
         """Update expert call frequency with historical smoothing.
@@ -831,7 +836,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
         Uses optimizer's second moment (exp_avg_sq) from FusedAdamLSQ.
         Scores computed for all experts across all layers (global ranking).
         """
-        print(f"[DEBUG compute_expert_scores] cpu_optimizer={self.cpu_optimizer is not None}")
         if self.cpu_optimizer is None:
             return
 
@@ -845,7 +849,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             exp_avg_sq_w1 = state_w1.get('exp_avg_sq')
             exp_avg_sq_w2 = state_w2.get('exp_avg_sq')
 
-            print(f"[DEBUG compute_expert_scores] global_expert_id={global_expert_id}, state_w1={len(state_w1)}, exp_avg_sq_w1={exp_avg_sq_w1 is not None}")
 
             if exp_avg_sq_w1 is None:
                 # State not initialized yet, skip scoring
@@ -882,7 +885,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             freq = self._call_frequency.get(global_expert_id, 1.0)
             self._expert_scores[global_expert_id] = (score_w1 + score_w2) * freq
 
-        print(f"[DEBUG compute_expert_scores] num_experts_with_state={num_experts_with_state}, _expert_scores={len(self._expert_scores)}")
 
     def update_quant_precision(self):
         """Update expert precision allocation based on global ranking.
@@ -892,20 +894,16 @@ class FusedAdamLSQCPUOffloadOptimizer:
         - Top 30% (top_int8_ratio): INT8
         - Rest: INT4
         """
-        print(f"[DEBUG update_quant_precision] _expert_scores={self._expert_scores}")
         if not self._expert_scores:
-            print("[DEBUG update_quant_precision] NO SCORES, returning")
             return
 
         # Sort all experts by score (descending) - global ranking across all layers
         scores = sorted(self._expert_scores.items(), key=lambda x: -x[1])
-        print(f"[DEBUG update_quant_precision] scores={scores}")
 
         num_total_experts = self.num_layers * self.num_experts_per_layer
         top_bf16_count = int(num_total_experts * self.top_bf16_ratio)
         # 使用 quant_pool 的 slot 数量，确保与 pool 容量一致
         top_int8_count = self.quant_pool.num_int8_slots
-        print(f"[DEBUG update_quant_precision] num_total_experts={num_total_experts}, top_bf16_count={top_bf16_count}, top_int8_count={top_int8_count}")
 
         for rank, (global_expert_id, score) in enumerate(scores):
             old_precision = self.quant_pool.get_precision(global_expert_id)
@@ -918,7 +916,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             else:
                 new_precision = 4   # INT4
 
-            print(f"[DEBUG update_quant_precision] rank={rank}, global_expert_id={global_expert_id}, old={old_precision}, new={new_precision}")
 
             # Apply precision change if needed
             if old_precision != new_precision:
@@ -937,7 +934,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             old_precision: Current precision (16/8/4)
             new_precision: Target precision (16/8/4)
         """
-        print(f"[DEBUG _transition_precision] global_expert_id={global_expert_id}, old={old_precision}, new={new_precision}")
         k = 16  # 2^(8-4)
 
         if old_precision == new_precision:
@@ -977,7 +973,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
             # GPU首次前向计算了delta/z, 已offload到buffer
             # 只需attach quant slot
             slot_idx = self.quant_pool.attach_quant_slot(global_expert_id, new_precision)
-            print(f"[DEBUG _transition_precision] BF16→{new_precision}, attached slot_idx={slot_idx}")
 
         # INT8/INT4 → BF16: detach quant slot, delta/z保留
         elif old_precision in [4, 8] and new_precision == 16:
@@ -986,7 +981,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
 
         # 更新精度记录
         self.quant_pool.expert_precision[global_expert_id] = new_precision
-        print(f"[DEBUG _transition_precision] expert_precision updated: {self.quant_pool.expert_precision[global_expert_id]}")
 
     def receive_gpu_updates(self, global_expert_id: int,
                             delta_w1: torch.Tensor, z_w1: torch.Tensor,
@@ -1113,26 +1107,17 @@ class FusedAdamLSQCPUOffloadOptimizer:
                 if precision == 16:
                     # BF16: Copy main weight to bf16 buffer
                     w1_cpu, w2_cpu = self._get_main_weight(global_expert_id)
-                    # print(f"[DEBUG prefetch] global_exp_id={global_expert_id}, precision={precision}, w1_cpu.shape={w1_cpu.shape}, w1_cpu.is_pinned={w1_cpu.is_pinned()}, gpu_buf.shape={gpu_w1_bf16_buffer[i].shape}, gpu_buf.device={gpu_w1_bf16_buffer[i].device}")
                     gpu_w1_bf16_buffer[i].copy_(w1_cpu, non_blocking=True)
                     gpu_w2_bf16_buffer[i].copy_(w2_cpu, non_blocking=True)
                 else:
                     # INT8/INT4: 检查quant是否已初始化
                     quant_initialized = self.quant_pool.is_quant_initialized(global_expert_id)
-                    print(f"[DEBUG prefetch] global_expert_id={global_expert_id}, precision={precision}, quant_initialized={quant_initialized}")
                     if not quant_initialized:
                         # Fallback: Use BF16 main weight instead
                         w1_cpu, w2_cpu = self._get_main_weight(global_expert_id)
-                        # print(f"[DEBUG prefetch] global_exp_id={global_expert_id}, SLOT NOT INITIALIZED")
-                        # print(f"[DEBUG prefetch] w1_cpu: shape={w1_cpu.shape}, dtype={w1_cpu.dtype}, is_pinned={w1_cpu.is_pinned()}, data_ptr={w1_cpu.data_ptr()}")
-                        # print(f"[DEBUG prefetch] w2_cpu: shape={w2_cpu.shape}, dtype={w2_cpu.dtype}, is_pinned={w2_cpu.is_pinned()}, data_ptr={w2_cpu.data_ptr()}")
-                        # print(f"[DEBUG prefetch] gpu_w1_buf: shape={gpu_w1_bf16_buffer[i].shape}, device={gpu_w1_bf16_buffer[i].device}")
-                        # print(f"[DEBUG prefetch] gpu_w2_buf: shape={gpu_w2_bf16_buffer[i].shape}, device={gpu_w2_bf16_buffer[i].device}")
                         # Use blocking copy for first pass to ensure GPU state is stable
                         gpu_w1_bf16_buffer[i].copy_(w1_cpu, non_blocking=False)
-                        # print(f"[DEBUG prefetch] w1 copy completed")
                         gpu_w2_bf16_buffer[i].copy_(w2_cpu, non_blocking=False)
-                        # print(f"[DEBUG prefetch] w2 copy completed")
                         # Override precision for this forward pass
                         precisions[-1] = 16
                         continue
@@ -1164,7 +1149,6 @@ class FusedAdamLSQCPUOffloadOptimizer:
                         gpu_delta_w2_buffer[i].copy_(delta_w2, non_blocking=True)
                     if gpu_z_w2_buffer is not None:
                         gpu_z_w2_buffer[i].copy_(z_w2, non_blocking=True)
-        print("precisions:" , precisions)
         return precisions
 
     def sync_gradient_offload(self):
@@ -1285,21 +1269,17 @@ class FusedAdamLSQCPUOffloadOptimizer:
         if self.cpu_optimizer is None:
             return
 
-        print(f"[DEBUG _sync_optimizer_quant_to_pool] step_count={self.step_count}")
         for global_expert_id, (w1_param, w2_param) in self._per_expert_weight_params.items():
             precision = self.quant_pool.get_precision(global_expert_id)
-            print(f"[DEBUG _sync_optimizer_quant_to_pool] global_expert_id={global_expert_id}, precision={precision}")
 
             if precision in [4, 8]:
                 # Sync quant_buffer from optimizer to pool
                 quant_w1 = self.cpu_optimizer.quant_buffers.get(w1_param)
                 quant_w2 = self.cpu_optimizer.quant_buffers.get(w2_param)
 
-                print(f"[DEBUG _sync_optimizer_quant_to_pool] quant_w1={quant_w1 is not None}, quant_w2={quant_w2 is not None}")
 
                 if quant_w1 is not None and quant_w2 is not None:
                     self.quant_pool.write_quant_weight(global_expert_id, quant_w1, quant_w2)
-                    print(f"[DEBUG _sync_optimizer_quant_to_pool] wrote quant_weight for {global_expert_id}")
 
     def _cpu_optimizer_step_thread(self):
         """Run CPU optimizer step in a background thread."""

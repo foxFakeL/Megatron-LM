@@ -490,7 +490,6 @@ class QuantizedDispatcherCacheGroupedMLP(MegatronModule):
     def forward(self, hidden_states: torch.Tensor, routing_map: torch.Tensor,
                 probs: torch.Tensor, expert_sets: List[List[int]]) -> Tuple[torch.Tensor, None]:
         """Forward pass using QuantizedDispatcherFunction."""
-        # print(f"[DEBUG QuantizedDispatcher.forward] layer_id={self.layer_id}, expert_sets={expert_sets}, routing_map.shape={routing_map.shape}")
         return QuantizedDispatcherFunction.apply(
             self, hidden_states, routing_map, probs, expert_sets
         )
@@ -520,56 +519,99 @@ class QuantizedDispatcherCacheGroupedMLP(MegatronModule):
     ) -> Tuple[torch.Tensor, List[List[List[int]]]]:
         """Exchange global schedule and token distribution across EP ranks.
 
+        CRITICAL: All distributed communication must happen on GPU tensors
+        because NCCL backend does not support CPU tensors.
+
         Returns:
             global_tokens_distribution: [ep_size, num_global_experts] CPU tensor
             global_expert_sets: [ep_size][num_sets][experts] complete schedule
         """
-        # Compute local token distribution
-        # routing_map: [num_tokens, num_global_experts] boolean
-        local_tokens_distribution = routing_map.sum(dim=0).cpu()  # [num_global_experts]
+        num_global_experts = self.num_global_experts
+        device = routing_map.device
+        num_sets = len(expert_sets)
 
-        # Compute local expert sets
-        local_expert_sets = expert_sets
+        # ============ Part 1: All-gather token distribution ============
+        # Local token count per expert (keep on GPU for NCCL communication)
+        local_tokens_per_expert = routing_map.sum(dim=0).long()  # [num_global_experts]
 
-        # All-gather across EP ranks
+        # All-gather on GPU FIRST to avoid device-host sync stall
+        global_tokens_distribution_gpu = torch.empty(
+            self.ep_size, num_global_experts, dtype=torch.long, device=device
+        )
+
         if self.ep_size > 1:
-            # Gather token distributions
-            global_tokens_distribution = torch.empty(
-                self.ep_size, self.num_global_experts,
-                dtype=torch.long, device='cpu'
-            )
             dist.all_gather_into_tensor(
-                global_tokens_distribution,
-                local_tokens_distribution,
+                global_tokens_distribution_gpu,
+                local_tokens_per_expert,
                 group=self.ep_group
             )
-
-            # Gather expert sets (serialize as list of lists)
-            # Each rank sends its expert_sets as a serialized string
-            import pickle
-            local_sets_bytes = pickle.dumps(local_expert_sets)
-
-            # Get sizes and gather
-            sizes_tensor = torch.tensor([len(local_sets_bytes)], dtype=torch.long, device='cpu')
-            all_sizes = torch.empty(self.ep_size, dtype=torch.long, device='cpu')
-            dist.all_gather(all_sizes, sizes_tensor, group=self.ep_group)
-            max_size = max(all_sizes.tolist())
-
-            # Pad local bytes and gather
-            padded_local = local_sets_bytes + b'\x00' * (max_size - len(local_sets_bytes))
-            all_bytes = [None] * self.ep_size
-            dist.all_gather_object(all_bytes, padded_local, group=self.ep_group)
-
-            # Deserialize
-            global_expert_sets = []
-            for i, bytes_data in enumerate(all_bytes):
-                # Trim padding
-                actual_size = all_sizes[i].item()
-                sets = pickle.loads(bytes_data[:actual_size])
-                global_expert_sets.append(sets)
         else:
-            global_tokens_distribution = local_tokens_distribution.unsqueeze(0)
-            global_expert_sets = [local_expert_sets]
+            global_tokens_distribution_gpu[0] = local_tokens_per_expert
+
+        # Copy to CPU after GPU communication is done
+        global_tokens_distribution = global_tokens_distribution_gpu.cpu()
+
+        # ============ Part 2: All-gather expert_sets (global schedule) ============
+        # Each rank contributes its expert_sets (experts IT processes per set)
+        # We use a fixed-size tensor approach to avoid pickle serialization on CPU
+
+        # First, communicate the number of sets (should be same across all ranks)
+        num_sets_tensor = torch.tensor([num_sets], dtype=torch.long, device=device)
+        if self.ep_size > 1:
+            all_num_sets = torch.empty(self.ep_size, dtype=torch.long, device=device)
+            dist.all_gather_into_tensor(
+                all_num_sets, num_sets_tensor, group=self.ep_group
+            )
+            # Verify all ranks have the same number of sets
+            if not torch.all(all_num_sets == num_sets):
+                raise RuntimeError(
+                    f"All ranks must have the same number of expert sets! "
+                    f"Got {all_num_sets.tolist()}, expected {num_sets}"
+                )
+
+        # Communicate max experts per set for buffer allocation
+        max_experts_per_set = max(len(s) for s in expert_sets) if expert_sets else 0
+        max_experts_tensor = torch.tensor([max_experts_per_set], dtype=torch.long, device=device)
+        if self.ep_size > 1:
+            all_max_experts = torch.empty(self.ep_size, dtype=torch.long, device=device)
+            dist.all_gather_into_tensor(
+                all_max_experts, max_experts_tensor, group=self.ep_group
+            )
+            global_max_experts = int(all_max_experts.max().item())
+        else:
+            global_max_experts = max_experts_per_set
+
+        # Create fixed-size tensor for expert_sets communication
+        # Shape: [num_sets, global_max_experts]
+        # Use -1 as padding for unused slots
+        expert_sets_tensor = torch.full(
+            (num_sets, global_max_experts), -1, dtype=torch.long, device=device
+        )
+        for set_idx, exp_ids in enumerate(expert_sets):
+            expert_sets_tensor[set_idx, :len(exp_ids)] = torch.tensor(exp_ids, device=device)
+
+        if self.ep_size > 1:
+            global_expert_sets_tensor = torch.empty(
+                self.ep_size, num_sets, global_max_experts, dtype=torch.long, device=device
+            )
+            dist.all_gather_into_tensor(
+                global_expert_sets_tensor.flatten(),
+                expert_sets_tensor.flatten(),
+                group=self.ep_group
+            )
+        else:
+            global_expert_sets_tensor = expert_sets_tensor.unsqueeze(0)
+
+        # Convert tensor back to nested lists, removing padding (-1 values)
+        global_expert_sets: List[List[List[int]]] = []
+        for rank_idx in range(self.ep_size):
+            rank_sets: List[List[int]] = []
+            for set_idx in range(num_sets):
+                expert_ids = global_expert_sets_tensor[rank_idx, set_idx].tolist()
+                # Filter out -1 padding values
+                expert_ids = [e for e in expert_ids if e >= 0]
+                rank_sets.append(expert_ids)
+            global_expert_sets.append(rank_sets)
 
         return global_tokens_distribution, global_expert_sets
 
@@ -1117,12 +1159,12 @@ class QuantizedDispatcherCacheGroupedMLP(MegatronModule):
         delta_w2_new = (delta_w2 - self.lr_quant * delta_grad_w2).clamp(min=1e-6)
         z_w2_new = z_w2 - self.lr_quant * z_grad_w2
 
-        # Store updates (will be sent to optimizer after backward)
+        # Update delta/z (keep on GPU, will be async offloaded later)
         self._delta_z_updates[global_expert_id] = (
-            delta_w1_new.cpu(),
-            z_w1_new.cpu(),
-            delta_w2_new.cpu(),
-            z_w2_new.cpu(),
+            delta_w1_new,  # GPU tensor
+            z_w1_new,
+            delta_w2_new,
+            z_w2_new,
         )
 
     def _offload_grads_to_cpu_async(
@@ -1132,12 +1174,13 @@ class QuantizedDispatcherCacheGroupedMLP(MegatronModule):
         grad_w1: torch.Tensor,  # GPU tensor [num_experts, ...]
         grad_w2: torch.Tensor,  # GPU tensor [num_experts, ...]
     ):
-        """Async offload gradients to CPU pinned memory on _grad_offload_stream.
+        """Async offload gradients + LSQ delta/z updates to CPU on _grad_offload_stream.
 
         Follows FusedDispatcherCacheGroupedMLP pattern:
         1. Wait for gradient computation completion (_grad_ready_events[set_idx])
-        2. Async copy to CPU pinned buffer (non_blocking=True)
-        3. record_stream to keep GPU memory in use
+        2. Async copy grad_w1/grad_w2 to CPU pinned buffer
+        3. Async copy delta/z updates to CPU (non_blocking=True)
+        4. record_stream to keep GPU memory in use
 
         Args:
             set_idx: Set index for selecting _grad_ready_events
@@ -1162,13 +1205,24 @@ class QuantizedDispatcherCacheGroupedMLP(MegatronModule):
                 grad_w1_flat = grad_w1[i].flatten().float()
                 grad_w2_flat = grad_w2[i].flatten().float()
 
-                # Async copy to CPU pinned buffer
+                # Async copy gradients to CPU pinned buffer
                 self._quant_optimizer.quant_pool.grad_w1[global_expert_id].copy_(
                     grad_w1_flat, non_blocking=True
                 )
                 self._quant_optimizer.quant_pool.grad_w2[global_expert_id].copy_(
                     grad_w2_flat, non_blocking=True
                 )
+
+                # Async offload LSQ delta/z updates (if computed)
+                if global_expert_id in self._delta_z_updates:
+                    delta_w1_new, z_w1_new, delta_w2_new, z_w2_new = self._delta_z_updates[global_expert_id]
+                    # Async copy to CPU
+                    self._delta_z_updates[global_expert_id] = (
+                        delta_w1_new.to('cpu', non_blocking=True),
+                        z_w1_new.to('cpu', non_blocking=True),
+                        delta_w2_new.to('cpu', non_blocking=True),
+                        z_w2_new.to('cpu', non_blocking=True),
+                    )
             nvtx.range_pop()
 
             # CRITICAL: record_stream AFTER copy_ operations are launched
@@ -1211,7 +1265,6 @@ class QuantizedDispatcherFunction(torch.autograd.Function):
         num_tokens = hidden_states.size(0)
         ctx.hidden_size = hidden_size
         ctx.num_tokens = num_tokens
-        # print(f"[DEBUG forward] hidden_states.dtype={dtype}, hidden_states.shape={hidden_states.shape}")
 
         # Ensure probs has the same dtype as hidden_states
         if probs.dtype != dtype:
@@ -1265,7 +1318,7 @@ class QuantizedDispatcherFunction(torch.autograd.Function):
             # CRITICAL: Wait for _load_stream to complete before running GPU kernels
             # _prefetch runs on _load_stream and returns immediately
             # We must sync before any GPU operations on main stream to avoid CUDA errors
-            torch.cuda.current_stream().wait_stream(self._load_stream)
+            # torch.cuda.current_stream().wait_stream(self._load_stream)
 
             # OPTIMIZATION: Precompute ALL expert indices (GPU kernels on compute stream)
             all_expert_indices = self._compute_all_expert_indices(
@@ -1450,7 +1503,6 @@ class QuantizedDispatcherFunction(torch.autograd.Function):
                 fc1_output = gg.ops.gmm(
                     current_recv_buffer, w1_bf16, tokens_per_expert, trans_b=False
                 )
-                # print(f"[DEBUG GEMM] fc1_output.dtype={fc1_output.dtype}, expected={dtype}")
                 # Ensure fc1_output has correct dtype
                 if fc1_output.dtype != dtype:
                     fc1_output = fc1_output.to(dtype)
@@ -1730,9 +1782,55 @@ class QuantizedDispatcherFunction(torch.autograd.Function):
             send_splits = current_send_splits
             recv_splits = current_recv_splits
 
-            # Recompute dispatched_tokens from hidden_states
-            dispatched_tokens = hidden_states[reverse_indices.to(device)] if reverse_indices.numel() > 0 else \
+            # ==================== REBUILD recv_tokens via all_to_all ====================
+            # CRITICAL: In backward, we need the recv-side tokens (expert order) to recompute GEMM
+            # The reverse_indices gives us send-side tokens (dest_rank order), not recv-side
+            # We need to exchange hidden_states via all_to_all to get recv-side data
+
+            # Build send buffer from hidden_states (same as forward)
+            send_tokens = hidden_states[reverse_indices.to(device)] if reverse_indices.numel() > 0 else \
                 torch.empty(0, hidden_size, dtype=dtype, device=device)
+
+            # Allocate recv buffer
+            recv_tokens = torch.empty(total_recv, hidden_size, dtype=dtype, device=device)
+
+            # Exchange data: send -> recv (same as forward's dispatch)
+            # CRITICAL: all ranks MUST participate in all_to_all_single (collective operation)
+            # Even if total_recv == 0, we must call it to avoid NCCL deadlock
+            if self.ep_size > 1:
+                nvtx.range_push(f"SET{set_idx}:BW_DISPATCH")
+                torch.distributed.all_to_all_single(
+                    recv_tokens, send_tokens,
+                    output_split_sizes=recv_splits,
+                    input_split_sizes=send_splits,
+                    group=self.ep_group
+                )
+                nvtx.range_pop()
+            else:
+                recv_tokens = send_tokens
+
+            # ==================== REPACK: Convert recv_tokens to expert order ====================
+            if self.ep_size > 1 and total_recv > 0 and num_local_experts > 0:
+                nvtx.range_push(f"SET{set_idx}:BW_REPACK_TOKENS")
+                repacked_tokens = torch.empty_like(recv_tokens)
+
+                src_offset = 0
+                expert_offsets = [0] + list(torch.cumsum(tokens_per_expert, 0)[:-1])
+
+                for src_rank in range(self.ep_size):
+                    for i, exp_id in enumerate(local_experts):
+                        count = global_tokens_distribution[src_rank][exp_id].item()
+                        if count > 0:
+                            repacked_tokens[expert_offsets[i]:expert_offsets[i] + count] = \
+                                recv_tokens[src_offset:src_offset + count]
+                            expert_offsets[i] += count
+                            src_offset += count
+
+                recv_tokens = repacked_tokens
+                nvtx.range_pop()
+
+            # Now recv_tokens is in expert order, matching forward's GEMM input
+            dispatched_tokens = recv_tokens
 
             # Recompute forward with enable_grad
             if total_recv > 0 and num_local_experts > 0:
@@ -1899,12 +1997,12 @@ class QuantizedDispatcherFunction(torch.autograd.Function):
                 current_grad_fc2 = prev_grad_fc2
 
         # ==================== Epilogue: Sync streams ====================
-        if self._grad_offload_stream is not None:
-            self._grad_offload_stream.synchronize()
-        if self._comm_stream is not None:
-            self._comm_stream.synchronize()
-        if self._load_stream is not None:
-            self._load_stream.synchronize()
+        # if self._grad_offload_stream is not None:
+        #     self._grad_offload_stream.synchronize()
+        # if self._comm_stream is not None:
+        #     self._comm_stream.synchronize()
+        # if self._load_stream is not None:
+        #     self._load_stream.synchronize()
 
         nvtx.range_pop()
 

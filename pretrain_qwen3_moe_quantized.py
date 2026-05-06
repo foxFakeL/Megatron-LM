@@ -254,6 +254,8 @@ def train(
     args = get_args()
     timers = get_timers()
 
+    rank = parallel_state.get_expert_model_parallel_rank()
+
     model.train()
 
     # Create data iterator
@@ -422,44 +424,32 @@ def train(
 
 def main():
     """Main entry point for Qwen3MoE pretrain with quantization."""
-    _main_start_time = time.time()
-    _debug_print = lambda msg: print(f"[DEBUG Main {time.time()-_main_start_time:.2f}s] {msg}")
-    _debug_print("main() started")
 
     # Parse arguments
-    _debug_print("Parsing arguments...")
     args = parse_args(extra_args_provider=add_qwen3_moe_args)
     validate_args(args, {'data_path': False})
-    _debug_print("Arguments parsed and validated")
 
     # Initialize Megatron
-    _debug_print("initialize_megatron()...")
     initialize_megatron(extra_args_provider=add_qwen3_moe_args)
-    _debug_print("initialize_megatron() done")
 
     args = get_args()
     timers = get_timers()
-    _debug_print("get_args() and get_timers() done")
 
     # Set random seeds
     ep_rank = parallel_state.get_expert_model_parallel_rank()
     torch.manual_seed(args.seed + ep_rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed + ep_rank)
-    _debug_print("Random seeds set")
 
     # Build model using quantized model provider
     timers('model-setup', log_level=0).start()
-    _debug_print("get_model()...")
     model = get_model(None, ModelType.encoder_or_decoder)  # model_provider_func unused
     timers('model-setup').stop()
-    _debug_print("Model created")
 
     print_rank_0(f'Model built with {sum(p.numel() for p in model.parameters()) / 1e9:.2f}B parameters')
     print_rank_0(f'Using QuantizedDispatcherCacheGroupedMLP with quant_group_size={args.quant_group_size}, lr_quant={args.lr_quant}')
 
     # Create optimizer
-    _debug_print("Creating optimizer...")
     if HAVE_QUANT_OPTIMIZER:
         print_rank_0("Using FusedAdamLSQCPUOffloadOptimizer with dynamic quantization")
         optimizer = FusedAdamLSQCPUOffloadOptimizer(
@@ -489,10 +479,12 @@ def main():
             warmup_steps=args.warmup_steps,
             clip_grad=args.clip_grad,
         )
-    _debug_print("Optimizer created")
+
+    rank = parallel_state.get_expert_model_parallel_rank()
 
     # Setup: Pass CPU update Event and quant_optimizer to expert modules
     cpu_update_event = optimizer.get_cpu_update_event()
+
     for layer in model.decoder.layers:
         if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'experts'):
             # Set CPU update event for synchronization
@@ -526,6 +518,8 @@ def main():
 
     # Get config
     config = core_transformer_config_from_args(args)
+
+    rank = parallel_state.get_expert_model_parallel_rank()
 
     # Train
     train(model, optimizer, train_dataloader, forward_step, config)

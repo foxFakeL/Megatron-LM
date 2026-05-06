@@ -2904,7 +2904,6 @@ class FusedDispatcherCacheGroupedMLP(CacheGroupedMLP):
             grad_w2: GPU gradient tensor for weight2
             set_idx: Set index for selecting the correct event (default 0)
         """
-        # ==================== DEBUG: Check for NaN BEFORE offload ====================
         # Removed debug check that caused synchronization
 
         with torch.cuda.stream(self._grad_offload_stream):
@@ -3660,7 +3659,6 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         # Explicitly clear to prevent memory accumulation before backward starts
         all_expert_indices.clear()
 
-        # ==================== DEBUG: Check forward output ====================
         # Removed - caused synchronization that masked race condition bug
 
         return output, None
@@ -4088,8 +4086,8 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         # This prevents PyTorch from releasing GPU memory (grad_w1, grad_w2) while
         # D2H copy is still in progress. Without this, next layer's forward/backward
         # may reuse this GPU memory, causing race condition: read (D2H) + write (new compute)
-        if self._grad_offload_stream is not None:
-            self._grad_offload_stream.synchronize()
+        # if self._grad_offload_stream is not None:
+        #     self._grad_offload_stream.synchronize()
 
         # ==================== Expert Optimizer ====================
         # Expert gradients are now on CPU, ready for DeepSpeed CPUAdam in optimizer.step()
@@ -4104,8 +4102,8 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         #   - L4 starts and its REV_COMBINE (all_to_all) uses the SAME ep_group
         #   - The two all_to_all operations interfere -> DATA CORRUPTION -> NaN
         # Each layer must fully complete its all_to_all before the next layer starts.
-        if self._comm_stream is not None:
-            self._comm_stream.synchronize()
+        # if self._comm_stream is not None:
+        #     self._comm_stream.synchronize()
 
         # ==================== CRITICAL: Sync Load Stream ====================
         # CRITICAL: Wait for all weight prefetch operations to complete before returning!
@@ -4116,8 +4114,8 @@ class FusedDispatcherCacheGroupedMLPFunction(torch.autograd.Function):
         # 3. If GPU memory allocator reuses memory between layers, DATA CORRUPTION occurs
         # Even though workspace is per-instance, the async operations must complete
         # before returning to ensure proper state for next layer's operations.
-        if self._load_stream is not None:
-            self._load_stream.synchronize()
+        # if self._load_stream is not None:
+        #     self._load_stream.synchronize()
 
         # ==================== CRITICAL: Clean up ctx to prevent memory leak ====================
         # PyTorch's autograd.Function automatically clears saved_tensors after backward,
