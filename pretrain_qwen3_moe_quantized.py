@@ -153,6 +153,7 @@ def add_qwen3_moe_args(parser):
                        help='Experts per processing set')
     group.add_argument('--rope-theta', type=float, default=1000000.0,
                        help='RoPE base frequency')
+    # --qk-layernorm is a standard Megatron arg defined in training/arguments.py
 
     # MoE optimization
     group.add_argument('--moe-activation-offload', action='store_true',

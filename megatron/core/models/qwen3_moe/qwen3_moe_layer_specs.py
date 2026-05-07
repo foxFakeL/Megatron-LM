@@ -14,12 +14,9 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
-try:
-    from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.extensions.transformer_engine import HAVE_TE, TENorm
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
 
 try:
     import apex
@@ -36,6 +33,7 @@ def get_qwen3_moe_layer_spec(
     use_te: bool = False,
     num_experts: Optional[int] = None,
     experts_per_set: int = 16,
+    qk_layernorm: bool = False,
 ) -> TransformerLayerSubmodules:
     """Get layer spec for Qwen3MoE model.
 
@@ -45,6 +43,7 @@ def get_qwen3_moe_layer_spec(
         use_te: Whether to use TransformerEngine
         num_experts: Number of experts (required for MoE layers)
         experts_per_set: Number of experts per processing set
+        qk_layernorm: Whether to use QK-Norm (Qwen3 has per-head Q/K normalization)
 
     Returns:
         TransformerLayerSubmodules spec
@@ -57,6 +56,10 @@ def get_qwen3_moe_layer_spec(
     # Norm implementation
     layernorm_spec = ModuleSpec(module=LNImpl)
 
+    # QK-Norm: Qwen3 uses per-head RMSNorm for Q and K
+    # Reference: gpt_layer_specs.py uses backend.layer_norm(for_qk=True)
+    qk_norm = backend.layer_norm(for_qk=True)
+
     # Attention spec - use standard Megatron SelfAttention
     # This includes Flash Attention support automatically
     self_attn_spec = ModuleSpec(
@@ -66,8 +69,8 @@ def get_qwen3_moe_layer_spec(
             linear_qkv=backend.column_parallel_linear(),
             core_attention=backend.core_attention(),
             linear_proj=backend.row_parallel_linear(),
-            q_layernorm=IdentityOp,
-            k_layernorm=IdentityOp,
+            q_layernorm=qk_norm if qk_layernorm else IdentityOp,
+            k_layernorm=qk_norm if qk_layernorm else IdentityOp,
         ),
     )
 
@@ -107,6 +110,7 @@ def get_qwen3_moe_block_spec(
     use_te: bool = False,
     num_experts: Optional[int] = None,
     experts_per_set: int = 16,
+    qk_layernorm: bool = False,
 ) -> TransformerBlockSubmodules:
     """Get block spec for Qwen3MoE model.
 
@@ -115,11 +119,12 @@ def get_qwen3_moe_block_spec(
         use_te: Whether to use TransformerEngine
         num_experts: Number of experts
         experts_per_set: Experts per processing set
+        qk_layernorm: Whether to use QK-Norm
 
     Returns:
         TransformerBlockSubmodules spec
     """
-    layer_spec = get_qwen3_moe_layer_spec(use_te, num_experts, experts_per_set)
+    layer_spec = get_qwen3_moe_layer_spec(use_te, num_experts, experts_per_set, qk_layernorm)
 
     # Create list of layer specs
     layer_specs = [layer_spec] * num_layers

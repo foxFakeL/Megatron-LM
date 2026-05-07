@@ -405,11 +405,13 @@ def model_provider(
 
     # Get block spec - use TE for attention (Flash Attention), local for quantized MoE
     use_te = getattr(config, 'transformer_impl', 'local') == 'transformer_engine'
+    qk_layernorm = getattr(args, 'qk_layernorm', False) or getattr(config, 'qk_layernorm', False)
     transformer_layer_spec = get_qwen3_moe_block_spec(
         num_layers=args.num_layers,
         use_te=use_te,  # Enable TransformerEngine for Flash Attention
         num_experts=num_experts,
         experts_per_set=experts_per_set,
+        qk_layernorm=qk_layernorm,
     )
 
     # Create model

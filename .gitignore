@@ -26,3 +26,5 @@ docs/apidocs
 *.sqlite
 *.log
 .claude
+run_shell
+profile

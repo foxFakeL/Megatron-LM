@@ -1475,10 +1475,10 @@ class SelfAttention(Attention):
             query = query[:, :, idx * size : (idx + 1) * size, :]
 
         if self.q_layernorm is not None:
-            query = self.q_layernorm(query)
+            query = self.q_layernorm(query.to(self.q_layernorm.weight.dtype)).to(query.dtype)
 
         if self.k_layernorm is not None:
-            key = self.k_layernorm(key)
+            key = self.k_layernorm(key.to(self.k_layernorm.weight.dtype)).to(key.dtype)
 
         if self.config.test_mode:
             self.run_realtime_tests()
